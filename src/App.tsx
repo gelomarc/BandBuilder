@@ -4,6 +4,7 @@ import { computeCosts, validate } from './core/engine'
 import { faction } from './core/pack'
 import { applyAction, newRoster, type Action } from './core/roster'
 import type { CategoryId, Pack, Roster } from './core/types'
+import { desktop } from './desktop'
 import {
   downloadJson,
   loadActiveId,
@@ -89,6 +90,9 @@ export function App() {
     past.current = [...past.current, roster]
     replace(next)
   }, [roster, replace])
+
+  // File > Wydruk / PDF in the desktop menu opens the print view, where the options live.
+  useEffect(() => desktop()?.onSavePdfRequested(() => setPrinting(true)), [])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

@@ -2,11 +2,13 @@ import { Fragment, useState } from 'react'
 import { effectiveStatline, gearLines, toMap } from '../core/engine'
 import { CATEGORY_SHORT, fighterIndex, fighterType } from '../core/pack'
 import type { CostReport, Fighter, Pack, Profile, Roster } from '../core/types'
+import { desktop } from '../desktop'
 
 /**
  * The printable document. Rendered on screen exactly as it prints, so the print dialog holds no
- * surprises; the browser's own "Save as PDF" produces the file, which keeps Polish diacritics and
- * real pagination without shipping an embedded font.
+ * surprises. The PDF itself comes from the host — Electron's printToPDF in the desktop app, the
+ * browser's own "Save as PDF" otherwise — which keeps Polish diacritics and real pagination
+ * without shipping an embedded font.
  */
 export function PrintView({
   pack,
@@ -26,6 +28,21 @@ export function PrintView({
   const [reference, setReference] = useState(true)
   const [campaign, setCampaign] = useState(roster.campaign.enabled)
   const [ruleText, setRuleText] = useState(false)
+  const [status, setStatus] = useState<{ text: string; filePath?: string } | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const app = desktop()
+  const fileName = `${roster.name} ${new Date().toISOString().slice(0, 10)}`
+
+  const savePdf = async () => {
+    if (!app) return
+    setBusy(true)
+    setStatus(null)
+    const result = await app.savePdf(fileName)
+    setBusy(false)
+    if (result.ok) setStatus({ text: 'Zapisano', filePath: result.filePath })
+    else if (result.error) setStatus({ text: `Nie udało się zapisać: ${result.error}` })
+  }
 
   return (
     <div className="print-root">
@@ -47,9 +64,31 @@ export function PrintView({
         <label className="row tiny">
           <input type="checkbox" checked={ruleText} onChange={(e) => setRuleText(e.target.checked)} /> Treść zasad
         </label>
-        <button className="primary" onClick={() => window.print()}>
-          Drukuj / Zapisz jako PDF
-        </button>
+        {status && (
+          <span className="tiny muted">
+            {status.text}
+            {status.filePath && (
+              <>
+                {' '}
+                <button className="ghost tiny" onClick={() => app?.reveal(status.filePath!)}>
+                  Pokaż plik
+                </button>
+              </>
+            )}
+          </span>
+        )}
+        {app ? (
+          <>
+            <button onClick={() => void app.print()}>Drukuj</button>
+            <button className="primary" disabled={busy} onClick={() => void savePdf()}>
+              {busy ? 'Zapisywanie…' : 'Zapisz PDF'}
+            </button>
+          </>
+        ) : (
+          <button className="primary" onClick={() => window.print()}>
+            Drukuj / Zapisz jako PDF
+          </button>
+        )}
       </div>
 
       <div className="paper">

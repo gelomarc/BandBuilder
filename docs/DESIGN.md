@@ -1,8 +1,8 @@
 # BandBuilder — dokument projektowy
 
-Wersja: 0.2 · Data: 2026-09-04 · Podstawa: [RESEARCH.md](RESEARCH.md)
+Wersja: 0.3 · Data: 2026-09-04 · Podstawa: [RESEARCH.md](RESEARCH.md)
 
-> Sekcje §1–§12 to projekt sprzed implementacji. **§13 opisuje to, co faktycznie zbudowano**, wraz z miejscami, w których realne dane BSData wymusiły zmianę modelu. Gdzie §13 mówi coś innego niż §1–§12, prawdą jest §13.
+> Sekcje §1–§12 to projekt sprzed implementacji. **§13 opisuje to, co faktycznie zbudowano**, wraz z miejscami, w których realne dane BSData wymusiły zmianę modelu; **§14 dokłada powłokę desktopową**. Gdzie §13–§14 mówią coś innego niż §1–§12, prawdą jest §13–§14.
 
 ---
 
@@ -647,9 +647,10 @@ Uwaga prawna: dane SWA to własność Games Workshop. Data packi trzymamy **osob
 | **M2** ✅ | Importer BSData + pełne dane SWA (15 frakcji) + raport DO UZUPEŁNIENIA. Eksport/import JSON | Prawdziwa treść, nie demo |
 | **M3** ✅ | Trzy szablony wydruku: karta drużyny, karty wojowników, ściąga broni | Wydruk używalny przy stole |
 | **M4** ✅ | Tryb kampanii: XP, drzewa umiejętności, awanse atrybutów, kontuzje, status, promethium caches, log gier | Wyróżnik wobec New Recruit dla SWA |
-| **M5** ⬜ | Share linki, PWA, wczytywanie własnych data packów, drugi system gry (Necromunda '95 / Mordheim) jako test generyczności modelu | Skalowanie |
+| **M5** ✅ | Wersja desktopowa: portable `.exe` z natywnym zapisem PDF (§14) | Produkt bez zależności od Node.js |
+| **M6** ⬜ | Share linki, PWA, wczytywanie własnych data packów, drugi system gry (Necromunda '95 / Mordheim) jako test generyczności modelu | Skalowanie |
 
-M0–M4 są zbudowane. Szczegóły i odstępstwa od projektu: §13.
+M0–M5 są zbudowane. Szczegóły i odstępstwa od projektu: §13 i §14.
 
 ---
 
@@ -729,3 +730,50 @@ Share linków, PWA, wczytywania własnych data packów z pliku, drugiego systemu
 ### 13.8 Testy
 
 `npm test` — 27 testów silnika na realnym data packu: koszty (baza, ekwipunek, ilości, ekwipunek w cenie, rozbicie po kategoriach), kasowanie osieroconych pod-wyborów, walidacja (leader, limity kategorii, budżet, New Recruits ≤ 50% budżetu, dynamiczny limit modeli za każdego Special Operative, limit per typ), kampania (awanse na statline, darmowość awansów, caches), akcje (nazewnictwo, duplikowanie, niemutowalność) oraz przejście po **wszystkich 123 typach wojowników** z zaznaczonym każdym możliwym elementem ekwipunku — na wypadek gdyby któraś frakcja miała kształt danych, którego silnik nie przewiduje.
+
+---
+
+## 14. Powłoka desktopowa (.exe)
+
+Dodana po tym, jak §1–§13 były już zbudowane, na wyraźną prośbę o wersję `.exe`. Ten sam build webowy jest rendererem — powłoka nie duplikuje ani linijki logiki aplikacji.
+
+### 14.1 Wybór technologii
+
+| Opcja | Rozmiar | Dlaczego nie / tak |
+|---|---|---|
+| **Electron** ✅ | ~75 MB portable | Własne okno i menu, gwarantowany runtime (Chromium w paczce, więc wygląd i wydruk są identyczne na każdej maszynie), natywny dialog zapisu PDF |
+| Tauri | ~8 MB | Wymaga Rusta i Visual Studio Build Tools do zbudowania, a w runtime WebView2 — czyli zachowanie zależy od wersji Edge'a na danym komputerze |
+| Node SEA (exe z serwerem) | ~110 MB | Nie jest aplikacją, tylko launcherem: otwiera przeglądarkę systemową. Większy od Electrona i słabszy produktowo |
+
+### 14.2 Renderer po HTTP, nie po `file://`
+
+Powłoka podnosi serwer HTTP na `127.0.0.1` z portem 0 (system wybiera wolny, więc dwie kopie aplikacji nigdy nie kolidują) i ładuje z niego stronę. Powód jest ten sam, dla którego istnieje `start.cmd` w wersji webowej: przeglądarki — Electron też — traktują `file://` jako opaque origin i mogą odmówić zapisu do `localStorage`, a tam żyją zapisane drużyny.
+
+Dane trafiają do `%APPDATA%\BandBuilder`, więc przetrwają przeniesienie samego `.exe`.
+
+### 14.3 PDF natywnie
+
+W wersji webowej trzeba przejść przez okno druku i wybrać „Zapisz jako PDF". W desktopowej jest `webContents.printToPDF` plus systemowy dialog zapisu — jeden klik, gotowy plik, przycisk „Pokaż plik" po zapisie. `Ctrl+P` otwiera widok wydruku (bo tam są opcje: co uwzględnić).
+
+Dwie rzeczy sprawdzone pomiarem, nie założone:
+
+1. **Marginesy.** `printToPDF` przyjmuje `margins`, ale sondą na stronie testowej (blok wysokości 265 mm, który mieści się na A4 przy marginesach 12 mm i nie mieści przy 24 mm) wyszło, że przy obecnym arkuszu `@page { size: A4; margin: 12mm }` wszystkie warianty `margins` — `custom`, `none`, `default` — dają bajt w bajt ten sam PDF. CSS wygrywa, więc parametr został usunięty jako mylący.
+2. **Pasek narzędzi nie wycieka do PDF-a.** Przy emulowanym `media: print` (CDP `Emulation.setEmulatedMedia`) `.print-bar` ma `display: none`, `.paper` zerowy padding, a tło `body` jest białe.
+
+Test end-to-end przechodzi całą ścieżkę na prawdziwym buildzie: skryptowo tworzy legalny kill team Scoutów, dokupuje broń, otwiera widok wydruku, włącza pola kampanii i generuje PDF — trzy strony, 93 KB, z wykrytym mostkiem desktopowym (`Zapisz PDF` zamiast `Drukuj / Zapisz jako PDF`).
+
+### 14.4 Granica renderer ↔ powłoka
+
+Renderer nie dostaje niczego z Node'a. `contextIsolation` włączone, `nodeIntegration` wyłączone, a `preload.cjs` wystawia dokładnie cztery rzeczy: zapis PDF, druk, pokazanie pliku w folderze i nasłuch na pozycję menu. `src/desktop.ts` po stronie strony zwraca `null`, gdy mostka nie ma — dzięki temu ten sam build działa w zwykłej przeglądarce i sam wraca do `window.print()`.
+
+Menu celowo nie ma sekcji „Edycja": jej natywne role undo/redo przechwyciłyby `Ctrl+Z`, zanim cofanie zmian w drużynie zdążyłoby je zobaczyć.
+
+### 14.5 Ikona bez narzędzi graficznych
+
+`tools/make-icon.mjs` generuje `build/icon.ico` arytmetycznie: celownik w kolorach aplikacji, 256×256, antyaliasowany supersamplingiem 3×3, zapisany jako ICO (nagłówek + bitmapa BGRA od dołu + pusta maska 1-bitowa). Repozytorium nie potrzebuje żadnej biblioteki do obrazków ani binarnego assetu w historii.
+
+### 14.6 Znane ograniczenia
+
+- **Brak podpisu kodu.** Przy pierwszym uruchomieniu Windows pokazuje SmartScreen. Podpisanie wymaga płatnego certyfikatu — nie ma sensu dla narzędzia dla jednej osoby.
+- **Build `.exe` wymaga obejścia** błędu `electron-builder` z symlinkami macOS w paczce `winCodeSign` na Windowsie bez trybu programisty. Procedura jest w README.
+- **Tylko x64 Windows.** Inne cele (`--linux`, `--mac`, arm64) są kwestią jednego przełącznika, ale nie były potrzebne.
