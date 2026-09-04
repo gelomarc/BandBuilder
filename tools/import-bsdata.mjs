@@ -394,7 +394,13 @@ const pack = {
     repo: 'https://github.com/BSData/wh40k-shadow-war-armageddon',
     note: 'Community BattleScribe data, not endorsed by Games Workshop. Imported by tools/import-bsdata.mjs.',
   },
-  vocabulary: { band: 'Kill Team', fighter: 'Fighter', currency: 'pts', campaignCurrency: 'Promethium Cache' },
+  vocabulary: {
+    band: 'Kill Team',
+    fighter: 'Wojownik',
+    fighterAcc: 'wojownika',
+    currency: 'pts',
+    campaignCurrency: 'Promethium Cache',
+  },
   budget: { default: 1000 },
   statline: STAT_IDS,
   categories: CATEGORIES,
@@ -482,9 +488,21 @@ for (const file of files.filter((f) => f.endsWith('.cat')).sort()) {
       }
     }
 
+    // A root without a statline is not a fighter, whatever its category says. Adepta Sororitas
+    // tags "Seraphim" (an upgrade that swaps a Sister's loadout) as a roster entry; emitting it as
+    // a fighter type would produce a model with no profile.
+    if (!statProfile) {
+      report.notes.push(`${faction.name}: skipped "${node.name}" — a ${target['@type']} with no statline`)
+      continue
+    }
+    // A handful of entries in the community data have blank characteristics. Show them as "?"
+    // rather than as an empty cell, and list them in the report so they can be filled in by hand.
     const statline = {}
-    if (statProfile) for (const s of STAT_IDS) statline[s] = statProfile.chars[s]
-    else warn(`${faction.name}: "${target['@name']}" has no statline profile`)
+    for (const s of STAT_IDS) {
+      const value = String(statProfile.chars[s] ?? '').trim()
+      statline[s] = value || '?'
+      if (!value) unmapped(`blank ${s} for ${faction.name} / ${node.name}`)
+    }
 
     faction.fighters.push({
       id: `${faction.id}--${node.ref}`,

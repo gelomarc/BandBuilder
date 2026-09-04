@@ -1,0 +1,258 @@
+/* The printable document: black on white, A4, laid out the same on screen and on paper. */
+
+.print-root {
+  background: #4a4f57;
+  min-height: 100%;
+}
+
+.print-bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.print-bar label {
+  color: var(--ink-dim);
+  gap: 4px;
+}
+
+.paper {
+  --pw: 210mm;
+  width: var(--pw);
+  margin: 16px auto;
+  background: #fff;
+  color: #111;
+  padding: 12mm;
+  font: 9.5pt/1.35 'Segoe UI', system-ui, sans-serif;
+}
+
+.paper h1 {
+  font-size: 16pt;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #111;
+  margin: 0;
+}
+
+.paper h2 {
+  font-size: 11pt;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #111;
+  margin: 0;
+}
+
+.paper h3.sub {
+  font-size: 10pt;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #444;
+  margin: 8pt 0 3pt;
+}
+
+.paper .ph {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  border-bottom: 1.5pt solid #111;
+  padding-bottom: 3pt;
+  margin-bottom: 6pt;
+}
+
+.paper .ph div {
+  font-size: 9pt;
+  color: #444;
+}
+
+.paper .summary {
+  display: flex;
+  gap: 14pt;
+  flex-wrap: wrap;
+  font-size: 9pt;
+  margin-bottom: 8pt;
+}
+
+.paper .summary .ok {
+  color: #14671f;
+  font-weight: 700;
+}
+
+.paper .summary .bad {
+  color: #a01a14;
+  font-weight: 700;
+}
+
+.paper table.grid {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.paper table.grid th,
+.paper table.grid td {
+  border: 0.5pt solid #999;
+  padding: 2pt 4pt;
+  text-align: left;
+  vertical-align: top;
+}
+
+.paper table.grid thead th {
+  background: #e8e8e8;
+  font-size: 8pt;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.paper table.grid .n {
+  text-align: center;
+  white-space: nowrap;
+}
+
+.paper table.grid.tight th,
+.paper table.grid.tight td {
+  padding: 1.5pt 3pt;
+  font-size: 8.5pt;
+}
+
+.paper table.grid tr.gear td {
+  font-size: 8pt;
+  color: #333;
+  border-top: none;
+  padding-top: 0;
+}
+
+.paper table.grid td.sp {
+  font-size: 8pt;
+  white-space: normal;
+}
+
+.paper .bx {
+  font-family: 'Segoe UI Symbol', 'Segoe UI', sans-serif;
+  letter-spacing: 1pt;
+  white-space: nowrap;
+}
+
+.paper .fcard {
+  border: 1pt solid #111;
+  border-radius: 2pt;
+  padding: 5pt 6pt;
+  margin-top: 6pt;
+  break-inside: avoid;
+}
+
+.paper .fcard > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8pt;
+  border-bottom: 0.5pt solid #999;
+  padding-bottom: 2pt;
+  margin-bottom: 4pt;
+}
+
+.paper .fcard > header span {
+  font-size: 8.5pt;
+  color: #444;
+}
+
+.paper .cardrow {
+  display: flex;
+  align-items: flex-end;
+  gap: 12pt;
+  margin-bottom: 4pt;
+}
+
+.paper .cardrow.campaign {
+  border-top: 0.5pt dashed #999;
+  padding-top: 3pt;
+  margin-top: 4pt;
+  align-items: baseline;
+}
+
+.paper .track {
+  display: flex;
+  align-items: baseline;
+  gap: 5pt;
+  font-size: 8.5pt;
+}
+
+.paper .track.grow {
+  flex: 1;
+}
+
+.paper .track .lbl {
+  text-transform: uppercase;
+  font-size: 7.5pt;
+  letter-spacing: 0.05em;
+  color: #555;
+}
+
+.paper .line {
+  margin: 3pt 0 0;
+  font-size: 8.5pt;
+}
+
+.paper .line.notes {
+  font-style: italic;
+  color: #333;
+}
+
+.paper dl.rules {
+  font-size: 8pt;
+  margin: 0;
+}
+
+.paper dl.rules dt {
+  font-weight: 700;
+  display: inline;
+}
+
+.paper dl.rules dd {
+  display: inline;
+  margin: 0 0 0 3pt;
+}
+
+.paper dl.rules div {
+  margin-bottom: 2pt;
+}
+
+.paper .page.break {
+  break-before: page;
+}
+
+@media print {
+  @page {
+    size: A4;
+    margin: 12mm;
+  }
+
+  html,
+  body,
+  #root {
+    height: auto;
+    background: #fff;
+  }
+
+  .print-bar {
+    display: none;
+  }
+
+  .print-root {
+    background: #fff;
+  }
+
+  .paper {
+    width: auto;
+    margin: 0;
+    padding: 0;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+}

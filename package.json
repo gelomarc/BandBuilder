@@ -9,10 +9,10 @@
     "preview": "vite preview",
     "test": "vitest run",
     "fetch-data": "node tools/fetch-bsdata.mjs",
-    "import-data": "node tools/import-bsdata.mjs"
+    "import-data": "node tools/import-bsdata.mjs",
+    "start": "node tools/serve.mjs"
   },
   "dependencies": {
-    "jspdf": "^2.5.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

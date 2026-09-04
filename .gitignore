@@ -2,4 +2,5 @@ node_modules/
 dist/
 data/bsdata/
 *.local
+*.tsbuildinfo
 .DS_Store

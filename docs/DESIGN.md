@@ -1,6 +1,8 @@
 # BandBuilder — dokument projektowy
 
-Wersja: 0.1 (draft do feedbacku) · Data: 2026-09-04 · Podstawa: [RESEARCH.md](RESEARCH.md)
+Wersja: 0.2 · Data: 2026-09-04 · Podstawa: [RESEARCH.md](RESEARCH.md)
+
+> Sekcje §1–§12 to projekt sprzed implementacji. **§13 opisuje to, co faktycznie zbudowano**, wraz z miejscami, w których realne dane BSData wymusiły zmianę modelu. Gdzie §13 mówi coś innego niż §1–§12, prawdą jest §13.
 
 ---
 
@@ -640,14 +642,14 @@ Uwaga prawna: dane SWA to własność Games Workshop. Data packi trzymamy **osob
 
 | M | Zakres | Efekt |
 |---|---|---|
-| **M0** | `schema` + `core`: model, `computeCosts`, `applyAction` dla `fighter/add|remove`. Data pack SWA ręcznie: 1 frakcja (Scouts), bez ekwipunku. Testy jednostkowe | Silnik działa, liczy punkty. Brak UI |
-| **M1** | `apps/web`: trzy kolumny, dodawanie/usuwanie wojowników, licznik punktów, IndexedDB, undo. Ekwipunek (slots) + `availableOptions`. Walidacja `bandRules`. **Wydruk print-CSS** | **Wszystkie 4 wymagania funkcjonalne działają.** Użyteczne przy stole |
-| **M2** | `importer-bsdata` + pełne dane SWA (wszystkie frakcje z BSData) + raport DO UZUPEŁNIENIA. Eksport/import JSON | Prawdziwa treść, nie demo |
-| **M3** | `packages/pdf` na `@react-pdf/renderer`: Roster Sheet + Fighter Cards + Weapon Reference | Wydruk jakości produkcyjnej |
-| **M4** | Tryb kampanii: XP, tabele awansów, kontuzje, promethium caches, stash, log gier | Wyróżnik wobec New Recruit dla SWA |
-| **M5** | Share linki, PWA offline, wczytywanie własnych data packów, drugi system gry (Necromunda '95 / Mordheim) jako test generyczności modelu | Skalowanie |
+| **M0** ✅ | `core`: model, `computeCosts`, `applyAction`, walidacja, testy jednostkowe | Silnik działa i jest przetestowany |
+| **M1** ✅ | UI: trzy kolumny, dodawanie/usuwanie wojowników, licznik punktów, ekwipunek, walidacja, zapis w przeglądarce, undo, wydruk | **Wszystkie 4 wymagania funkcjonalne działają** |
+| **M2** ✅ | Importer BSData + pełne dane SWA (15 frakcji) + raport DO UZUPEŁNIENIA. Eksport/import JSON | Prawdziwa treść, nie demo |
+| **M3** ✅ | Trzy szablony wydruku: karta drużyny, karty wojowników, ściąga broni | Wydruk używalny przy stole |
+| **M4** ✅ | Tryb kampanii: XP, drzewa umiejętności, awanse atrybutów, kontuzje, status, promethium caches, log gier | Wyróżnik wobec New Recruit dla SWA |
+| **M5** ⬜ | Share linki, PWA, wczytywanie własnych data packów, drugi system gry (Necromunda '95 / Mordheim) jako test generyczności modelu | Skalowanie |
 
-Zakres M1 = kompletna realizacja zamówienia (F1–F4). M0 to fundament, M2+ to jakość i treść.
+M0–M4 są zbudowane. Szczegóły i odstępstwa od projektu: §13.
 
 ---
 
@@ -655,9 +657,75 @@ Zakres M1 = kompletna realizacja zamówienia (F1–F4). M0 to fundament, M2+ to 
 
 | # | Pytanie | Moja rekomendacja |
 |---|---|---|
-| O1 | Skąd biorą się dane SWA: import z BSData czy podsumowanie od drugiego agenta? | Oba: podsumowanie od agenta jako źródło prawdy dla reguł i kalibracji, BSData jako źródło masy (profile broni, statline'y). Dopóki nie zobaczę podsumowania, nie zamykam struktury `fighterTypes` — dlatego ten dokument jest wersją 0.1 |
-| O2 | Tryb kampanii w v1 czy później? | Model danych **od razu** (D3, nie ma odwrotu), UI w M4 |
-| O3 | Walidacja data packa: Zod czy JSON Schema + Ajv? | **JSON Schema** — bo data packi pisze też ktoś inny niż my (autorzy danych), a JSON Schema daje autouzupełnianie w VS Code i jest niezależny od TS. Typy TS generujemy ze schematu |
-| O4 | Czy `granted` ekwipunek ma być usuwalny? | Nie, ale z możliwością wymiany, jeśli data pack tak zadeklaruje (`granted[].replaceableFrom`) |
-| O5 | Wielojęzyczność UI (PL/EN)? | UI od razu przez klucze i18n (koszt bliski zeru na starcie), dane w języku data packa (SWA = angielski, bo takie są nazwy w grze) |
-| O6 | Nazwa modelu jako część rostera czy tylko typ? | Nazwa własna jest obowiązkowa w kampanii i przydatna zawsze — domyślnie generowana (`Scout #2`), edytowalna |
+| O1 | Skąd biorą się dane SWA: import z BSData czy podsumowanie od drugiego agenta? | **Rozstrzygnięte:** danych od agenta nie będzie, całość pochodzi z importu BSData (§13.1) |
+| O2 | Tryb kampanii w v1 czy później? | **Rozstrzygnięte:** zbudowany w całości (§13.5) |
+| O3 | Walidacja data packa: Zod czy JSON Schema + Ajv? | **Odłożone.** Data pack ma jednego producenta (nasz importer) i jest sprawdzany testami na realnej treści, więc schemat runtime nie kupuje na razie niczego. Wróci, gdy ktoś zacznie pisać data packi ręcznie |
+| O4 | Czy ekwipunek „w cenie" ma być usuwalny? | **Rozstrzygnięte:** nie. Pozycje z `min = max ≥ 1` są oznaczone „w cenie" i nieodznaczalne |
+| O5 | Wielojęzyczność UI (PL/EN)? | **Rozstrzygnięte:** UI po polsku, nazwy z gry po angielsku (bo takie są na modelach i w rulebooku). Warstwy i18n nie ma — aplikacja ma jednego użytkownika |
+| O6 | Nazwa modelu jako część rostera czy tylko typ? | **Rozstrzygnięte:** własna nazwa, domyślnie `Scout`, `Scout 2`… liczone per typ, edytowalna |
+
+---
+
+## 13. Co zbudowano — i czym się to różni od projektu 0.1
+
+Kolejność prac: research → projekt (§1–§12) → import danych → silnik → UI → wydruk. Zderzenie z realnymi plikami BSData wymusiło cztery zmiany w modelu. Wszystkie idą w stronę **wierności danym**, nie wygody.
+
+### 13.1 Dane: importer zamiast ręcznego data packa
+
+Danych od drugiego agenta nie będzie, więc jedynym źródłem jest [BSData/wh40k-shadow-war-armageddon](https://github.com/BSData/wh40k-shadow-war-armageddon). `tools/import-bsdata.mjs` rozwiązuje graf `entryLink`-ów w płaskie drzewo i produkuje jeden plik `src/data/swa.json` (~900 KB).
+
+Wynik: **15 frakcji, 123 typy wojowników, 2326 węzłów ekwipunku, 475 profili.** Jedna niezmapowana konstrukcja i dwa konflikty w danych źródłowych, wszystkie wypisane w [IMPORT-REPORT.md](../data/IMPORT-REPORT.md).
+
+Trzy rzeczy, których projekt nie przewidział, a dane wymusiły:
+
+1. **Nazwy kategorii różnią się między katalogami** — „Leader" vs „Kill Team Leader", „Trooper" vs „Troopers" vs „Tooper" (literówka w źródle), Tau ma osobną kategorię „Drone". Importer dopasowuje po kształcie nazwy, nie po dokładnym stringu, i sprowadza wszystko do pięciu kanonicznych kategorii.
+2. **Każdy katalog ma własny `forceEntry`**, czasem niekompletny. Reguły drużyny są scalane: baza z `.gst`, nadpisania z `.cat`. Dzięki temu odstępstwa frakcyjne przechodzą przez import same z siebie — Orkowie 3–20 modeli, Guard i Skitarii 3 Specialistów, Genestealer Cults 15 modeli, Grey Knights i Tyranidy maks. 5.
+3. **W danych są sprzeczności.** Ork Boyz deklaruje jednocześnie „max 20" i „max 3" modeli bez żadnego minimum; Adepta Sororitas oznacza „Seraphim" (ulepszenie, nie model) jako pozycję rostera; Genestealer „Neophyte Initiate" ma puste BS i S. Importer rozstrzyga to jawną, opisaną regułą i **wypisuje każdy przypadek w raporcie** — nigdy nie zgaduje po cichu. Puste statystyki trafiają do danych jako `?`, żeby braku nie dało się przeoczyć na wydruku.
+
+### 13.2 Ekwipunek: rekurencyjne drzewo zamiast płaskich slotów
+
+Projekt (§4.4) zakładał `slots[].from` — płaską listę arsenału per slot. Realne dane są głębsze: grupa może zawierać grupy (`entryLink type="selectionEntryGroup"`), a broń ma własne podzakupy, które mają własne grupy. Scout Sergeant to `Gear → Basic Weapons → Boltgun → {Weapon Reload, Scopes → Telescopic sight, Ammunition → Hellfire bolts}`.
+
+Model jest więc drzewem dwóch rodzajów węzłów:
+
+```ts
+type LoadoutNode =
+  | { k: 'g', id, name, min, max, children }                          // grupa wyborów
+  | { k: 'i', id, ref, name, cost, min, max, profiles, rules, children, effect? }
+```
+
+Konsekwencje, które wyszły na plus: „ekwipunek w cenie" to zwykły węzeł z `min = max = 1` (nie osobny mechanizm), a wymagane pod-wybory („Missile launcher → wybierz typ pocisku") walidują się tą samą regułą co wszystko inne.
+
+### 13.3 Selekcje: płaska mapa zamiast drzewa w rosterze
+
+Projekt (§5) trzymał w rosterze zagnieżdżone `items[].options[]`. Okazało się, że **identyfikatory węzłów są unikalne w obrębie typu wojownika** (sprawdzone: 4360 węzłów, zero kolizji), więc wybór to po prostu `{ nodeId, qty }`, a pozycja w drzewie jest odtwarzalna z data packa. Roster nie może się rozjechać z katalogiem, bo nie duplikuje jego struktury.
+
+Usunięcie broni kasuje jej pod-wybory (`prune`), a wybranie czegokolwiek dociąga obowiązkowe pozycje (`autoFill`) — obie funkcje iterują do stabilizacji, bo ulepszenie może odsłonić kolejne obowiązkowe ulepszenie.
+
+### 13.4 PDF: wydruk przez przeglądarkę, nie generator
+
+Projekt rekomendował `@react-pdf/renderer`. Odrzucone po sprawdzeniu kosztu: wbudowane fonty generatorów PDF (jsPDF, react-pdf) używają WinAnsi, w którym **nie ma polskich znaków**, a osadzenie własnego fontu to ~0,5 MB base64 w pliku, który ma działać offline z dysku.
+
+Zamiast tego jest widok `PrintView`, który renderuje dokument A4 na ekranie dokładnie tak, jak wyjdzie na papierze, i oddaje generowanie PDF-a przeglądarce (*Zapisz jako PDF*). Zysk poza rozmiarem: poprawna polszczyzna, prawdziwa paginacja z `break-inside: avoid` na kartach i podgląd WYSIWYG zamiast niewidocznego arkusza `@media print`.
+
+Trzy szablony z §9 są zbudowane wszystkie. Karta wojownika ma **ujednoliconą tabelę broni** (strzelecka, biała i granaty w jednej tabeli, bo przy stole nikt nie przeskakuje między trzema) oraz kratki na amunicję liczone jako *jeden strzał + jeden na każdy wykupiony reload*.
+
+### 13.5 Kampania: zbudowana, nie odłożona
+
+Skoro dane BSData zawierają drzewa umiejętności i tabele awansów atrybutów, koszt dodania kampanii spadł do zera po stronie treści. Zbudowane: XP, wybór umiejętności z drzew frakcyjnych, awanse atrybutów wpływające na efektywny statline (z podświetleniem zmienionej wartości i podpowiedzią wartości bazowej), lista kontuzji, status wojownika, promethium caches, log gier.
+
+Awanse są trzymane osobno od ekwipunku (`fighter.campaign.advances` vs `fighter.gear`) i nie wchodzą do kosztu drużyny — importer rozdziela drzewo na podstawie grup `Skills` i `Advance Attributes`.
+
+### 13.6 Struktura: jedna aplikacja zamiast monorepo
+
+§3 zakładało `packages/*` + `apps/web`. Dla narzędzia z jednym użytkownikiem monorepo to koszt bez korzyści, więc jest jeden projekt Vite z zachowanym rozdziałem, który był w tym istotny: `src/core` nie importuje niczego z UI i jest testowany bez DOM-u.
+
+Build to jeden samowystarczalny plik HTML (`vite-plugin-singlefile`, ~1,1 MB) — bez CDN, bez fetchowania czegokolwiek w runtime. `start.cmd` podaje go po `http://localhost`, bo przeglądarki traktują `file://` jako opaque origin i część z nich odmawia zapisu do `localStorage`; aplikacja wykrywa taki przypadek i ostrzega.
+
+### 13.7 Czego nie ma
+
+Share linków, PWA, wczytywania własnych data packów z pliku, drugiego systemu gry, narzędzi turniejowych, trackingu kolekcji, edytora danych. Nic z tego nie było w zamówieniu.
+
+### 13.8 Testy
+
+`npm test` — 27 testów silnika na realnym data packu: koszty (baza, ekwipunek, ilości, ekwipunek w cenie, rozbicie po kategoriach), kasowanie osieroconych pod-wyborów, walidacja (leader, limity kategorii, budżet, New Recruits ≤ 50% budżetu, dynamiczny limit modeli za każdego Special Operative, limit per typ), kampania (awanse na statline, darmowość awansów, caches), akcje (nazewnictwo, duplikowanie, niemutowalność) oraz przejście po **wszystkich 123 typach wojowników** z zaznaczonym każdym możliwym elementem ekwipunku — na wypadek gdyby któraś frakcja miała kształt danych, którego silnik nie przewiduje.
