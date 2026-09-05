@@ -1,159 +1,97 @@
-import { CATEGORY_ORDER, categoryName, fighterIndex, fighterType, faction } from './pack'
-import type {
-  BandRule,
-  CategoryId,
-  CostReport,
-  Fighter,
-  FighterType,
-  GroupNode,
-  Issue,
-  ItemNode,
-  LoadoutNode,
-  Pack,
-  Roster,
-  Sel,
-  StatId,
-} from './types'
-import type { NodeIndex } from './pack'
+import { Ctx } from './evaluate'
+import type { UnitView } from './evaluate'
+import type { Node } from './tree'
+import type { CostReport, Force, Id, Issue, Pack, Roster, Sel } from './types'
 
-// --- selections ------------------------------------------------------------------------------
+export { Ctx } from './evaluate'
+export type { UnitView, Effective } from './evaluate'
 
-export function toMap(sels: Sel[]): Map<string, number> {
+export const selMap = (sels: Sel[]): Map<string, number> => {
   const m = new Map<string, number>()
-  for (const s of sels) if (s.qty > 0) m.set(s.nodeId, s.qty)
+  for (const s of sels) if (s.qty > 0) m.set(s.path, s.qty)
   return m
 }
 
-export function toSels(m: Map<string, number>): Sel[] {
-  return [...m.entries()].filter(([, q]) => q > 0).map(([nodeId, qty]) => ({ nodeId, qty }))
-}
+export const selList = (m: Map<string, number>): Sel[] =>
+  [...m.entries()].filter(([, q]) => q > 0).map(([path, qty]) => ({ path, qty }))
 
-/**
- * A node can be used only if every item on the way to it is selected. Groups are containers and
- * pass through, so "Scopes" under an unselected Boltgun is unreachable, but "Pistols" under the
- * fighter root always is.
- */
-export function isReachable(nodeId: string, idx: NodeIndex, sel: Map<string, number>): boolean {
-  for (const a of idx.ancestorsOf.get(nodeId) ?? []) {
-    const node = idx.byId.get(a)
-    if (node?.k === 'i' && !sel.has(a)) return false
+/** A node is live only when every entry above it is selected; groups pass through. */
+export function isLive(view: UnitView, node: Node): boolean {
+  for (const a of node.ancestorNodes) {
+    if (a.path === view.root.path) continue
+    if (a.k === 'e' && !view.selected.has(a.path)) return false
   }
   return true
 }
 
-/** How many picks a group currently holds — item quantities count, nested groups do not. */
-export function groupCount(group: GroupNode, sel: Map<string, number>): number {
+/** Picks currently inside a group: item quantities count, nested groups do not. */
+export function groupCount(view: UnitView, group: Node, tree = view.tree, deep = false): number {
   let n = 0
-  for (const c of group.children) if (c.k === 'i') n += sel.get(c.id) ?? 0
+  for (const child of tree.children(group)) {
+    if (child.k === 'e') n += view.selected.get(child.path) ?? 0
+    else if (deep) n += groupCount(view, child, tree, deep)
+  }
   return n
 }
 
-/** Why a node cannot be picked right now, or null when it can. */
-export function blockedReason(
-  node: ItemNode,
-  idx: NodeIndex,
-  sel: Map<string, number>,
-): string | null {
-  if (!isReachable(node.id, idx, sel)) return 'wymaga wcześniejszego wyboru'
-  const have = sel.get(node.id) ?? 0
-  if (node.max !== null && have >= node.max)
-    return node.max === 1 ? 'już wybrane' : `limit ${node.max} szt.`
-  const parentId = idx.parentOf.get(node.id)
-  const parent = parentId ? idx.byId.get(parentId) : null
-  if (parent?.k === 'g' && parent.max !== null && groupCount(parent, sel) >= parent.max)
-    return `grupa pełna (${parent.max}/${parent.max})`
-  return null
-}
+/** How many of this node the unit currently holds. */
+export const qtyOf = (view: UnitView, node: Node): number =>
+  node.path === view.root.path ? 1 : (view.selected.get(node.path) ?? 0)
 
-/** Items the data marks as mandatory (min >= 1) and that are reachable but not yet picked. */
-export function autoFill(type: FighterType, sels: Sel[]): Sel[] {
-  const idx = fighterIndex(type)
-  const sel = toMap(sels)
-  // Repeat until stable: granting an item can make its own children reachable and mandatory.
-  for (let pass = 0; pass < 6; pass++) {
-    let changed = false
-    for (const [id, node] of idx.byId) {
-      if (node.k !== 'i' || !node.min || node.min < 1) continue
-      if (!isReachable(id, idx, sel)) continue
-      if ((sel.get(id) ?? 0) >= node.min) continue
-      sel.set(id, node.min)
-      changed = true
-    }
-    if (!changed) break
-  }
-  return toSels(sel)
-}
+// --- costs --------------------------------------------------------------------------------------
 
-/** Mandatory, non-removable gear: min >= 1 means the fighter always carries it. */
-export function isGranted(node: LoadoutNode): boolean {
-  return node.k === 'i' && node.min !== null && node.min >= 1 && node.max === node.min
-}
-
-// --- costs -----------------------------------------------------------------------------------
-
-export function fighterCost(pack: Pack, roster: Roster, fighter: Fighter): number {
-  const type = fighterType(pack, roster.factionId, fighter.typeId)
-  if (!type) return 0
-  const idx = fighterIndex(type)
-  let total = type.cost
-  for (const s of fighter.gear) {
-    const node = idx.byId.get(s.nodeId)
-    if (node?.k === 'i') total += node.cost * s.qty
+export function unitCost(ctx: Ctx, view: UnitView, costType = ctx.pack.primaryCost): number {
+  let total = ctx.effective(view, view.root).cost[costType] ?? 0
+  for (const [path, qty] of view.selected) {
+    const node = view.nodes.get(path)
+    if (!node) continue
+    total += (ctx.effective(view, node).cost[costType] ?? 0) * qty
   }
   return total
 }
 
-export function computeCosts(pack: Pack, roster: Roster): CostReport {
-  const byFighter: Record<string, number> = {}
-  const byCategory = { leader: 0, specialist: 0, trooper: 0, recruit: 0, operative: 0 } as Record<
-    CategoryId,
-    number
-  >
+export function computeCosts(ctx: Ctx): CostReport {
+  const pack = ctx.pack
+  const byUnit: Record<Id, number> = {}
+  const byCategory: Record<Id, number> = {}
+  const byCostType: Record<Id, number> = {}
   let total = 0
-  for (const f of roster.fighters) {
-    const c = fighterCost(pack, roster, f)
-    byFighter[f.uid] = c
-    total += c
-    const type = fighterType(pack, roster.factionId, f.typeId)
-    if (type) byCategory[type.categoryId] += c
-  }
-  return { total, budget: roster.budget, remaining: roster.budget - total, byFighter, byCategory }
-}
 
-// --- statline --------------------------------------------------------------------------------
-
-export type StatCell = { value: string; base: string; changed: boolean }
-
-/** Base profile plus every attribute advance the fighter has taken. */
-export function effectiveStatline(
-  pack: Pack,
-  roster: Roster,
-  fighter: Fighter,
-): Record<StatId, StatCell> {
-  const type = fighterType(pack, roster.factionId, fighter.typeId)
-  const out = {} as Record<StatId, StatCell>
-  if (!type) return out
-  const idx = fighterIndex(type)
-  const deltas = {} as Record<string, number>
-  for (const s of fighter.campaign.advances) {
-    const node = idx.byId.get(s.nodeId)
-    if (node?.k === 'i' && node.effect) deltas[node.effect.stat] = (deltas[node.effect.stat] ?? 0) + node.effect.delta * s.qty
-  }
-  for (const stat of pack.statline) {
-    const base = type.statline[stat] ?? '-'
-    const d = deltas[stat] ?? 0
-    let value = base
-    if (d !== 0) {
-      // Movement is written with an inch mark; everything else is a plain number.
-      const m = /^(\d+)(.*)$/.exec(base)
-      value = m ? `${Number(m[1]) + d}${m[2]}` : base
+  for (const view of ctx.units) {
+    const cost = unitCost(ctx, view)
+    byUnit[view.unit.uid] = cost
+    total += cost
+    const cat = primaryCategory(ctx, view)
+    if (cat) byCategory[cat] = (byCategory[cat] ?? 0) + cost
+    for (const type of pack.costTypes) {
+      const value = unitCost(ctx, view, type.id)
+      if (value) byCostType[type.id] = (byCostType[type.id] ?? 0) + value
     }
-    out[stat] = { value, base, changed: value !== base }
   }
-  return out
+
+  return {
+    total,
+    budget: ctx.roster.budget,
+    remaining: ctx.roster.budget - total,
+    byUnit,
+    byCategory,
+    byCostType,
+  }
 }
 
-// --- validation ------------------------------------------------------------------------------
+/** The category a unit occupies in a force organisation slot. */
+export function primaryCategory(ctx: Ctx, view: UnitView): Id | null {
+  const eff = ctx.effective(view, view.root)
+  return view.root.primary ?? eff.cats[0] ?? null
+}
+
+export function categoriesOf(ctx: Ctx, view: UnitView): Id[] {
+  return ctx.effective(view, view.root).cats
+}
+
+// --- validation ---------------------------------------------------------------------------------
+
+const categoryName = (pack: Pack, id: Id) => pack.categories.find((c) => c.id === id)?.name ?? id
 
 /** Polish needs three plural forms; "3 modeli" instead of "3 modele" reads like a bug. */
 function plural(n: number, one: string, few: string, many: string): string {
@@ -164,155 +102,221 @@ function plural(n: number, one: string, few: string, many: string): string {
   return many
 }
 
-function ruleLimit(rule: BandRule, roster: Roster, pack: Pack): number {
-  let limit = rule.value
-  if (rule.unit === 'percentOfBudget') limit = Math.floor((rule.value / 100) * roster.budget)
-  else if (rule.unit === 'percentOfCount') limit = Math.floor((rule.value / 100) * roster.fighters.length)
-  for (const adj of rule.adjust ?? []) {
-    const n = roster.fighters.filter((f) => categoryOf(pack, roster, f) === adj.perFighterWhere.category).length
-    limit += adj.delta * n
-  }
-  return limit
-}
+const picks = (n: number) => plural(n, 'wybór', 'wybory', 'wyborów')
 
-export function categoryOf(pack: Pack, roster: Roster, fighter: Fighter): CategoryId | null {
-  return fighterType(pack, roster.factionId, fighter.typeId)?.categoryId ?? null
-}
-
-function ruleActual(rule: BandRule, pack: Pack, roster: Roster, costs: CostReport): number {
-  const inScope = rule.where
-    ? roster.fighters.filter((f) => categoryOf(pack, roster, f) === rule.where!.category)
-    : roster.fighters
-  if (rule.count === 'cost') return inScope.reduce((n, f) => n + (costs.byFighter[f.uid] ?? 0), 0)
-  return inScope.length
-}
-
-export function validate(pack: Pack, roster: Roster, costs: CostReport): Issue[] {
+export function validate(ctx: Ctx, costs: CostReport): Issue[] {
   const issues: Issue[] = []
-  const fac = faction(pack, roster.factionId)
-  if (!fac) return [{ ruleId: 'faction', severity: 'error', scope: 'band', message: 'Nieznana frakcja' }]
+  const pack = ctx.pack
 
-  if (costs.total > roster.budget)
+  if (costs.total > costs.budget)
     issues.push({
       ruleId: 'budget',
       severity: 'error',
       scope: 'band',
-      message: `Przekroczony budżet o ${costs.total - roster.budget} ${pack.vocabulary.currency}`,
+      message: `Przekroczony budżet o ${costs.total - costs.budget} ${pack.vocabulary.currency}`,
     })
 
-  for (const rule of fac.bandRules) {
-    const limit = ruleLimit(rule, roster, pack)
-    const actual = ruleActual(rule, pack, roster, costs)
-    const what = rule.where ? categoryName(pack, rule.where.category) : pack.vocabulary.band
-    const unit = (n: number) => (rule.count === 'cost' ? pack.vocabulary.currency : plural(n, 'model', 'modele', 'modeli'))
-    if (rule.type === 'min' && actual < limit)
-      issues.push({
-        ruleId: rule.id,
-        severity: 'error',
-        scope: 'band',
-        message: `${what}: minimum ${limit} ${unit(limit)}, jest ${actual}`,
-      })
-    if (rule.type === 'max' && actual > limit)
-      issues.push({
-        ruleId: rule.id,
-        severity: 'error',
-        scope: 'band',
-        message: `${what}: maksimum ${limit} ${unit(limit)}, jest ${actual}`,
-      })
-  }
-
-  // One fighter type may be capped on its own (a named leader, a unique operative).
-  for (const type of fac.fighters) {
-    if (type.max === null) continue
-    const n = roster.fighters.filter((f) => f.typeId === type.id).length
-    if (n > type.max)
-      issues.push({
-        ruleId: `type-max-${type.id}`,
-        severity: 'error',
-        scope: 'band',
-        message: `${type.name}: maksimum ${type.max} w drużynie, jest ${n}`,
-      })
-  }
-
-  for (const f of roster.fighters) {
-    const type = fighterType(pack, roster.factionId, f.typeId)
-    if (!type) {
-      issues.push({
-        ruleId: 'unknown-type',
-        severity: 'error',
-        scope: 'fighter',
-        targetUid: f.uid,
-        message: `${f.name}: typ nieobecny w danych`,
-      })
-      continue
-    }
-    const idx = fighterIndex(type)
-    const sel = toMap(f.gear)
-    for (const [id, node] of idx.byId) {
-      if (!isReachable(id, idx, sel)) continue
-      if (node.k === 'g') {
-        const n = groupCount(node, sel)
-        if (node.min !== null && n < node.min)
-          issues.push({
-            ruleId: `group-min-${id}`,
-            severity: 'error',
-            scope: 'fighter',
-            targetUid: f.uid,
-            message: `${f.name} / ${node.name}: wybierz co najmniej ${node.min}`,
-          })
-        if (node.max !== null && n > node.max)
-          issues.push({
-            ruleId: `group-max-${id}`,
-            severity: 'error',
-            scope: 'fighter',
-            targetUid: f.uid,
-            message: `${f.name} / ${node.name}: najwyżej ${node.max}, jest ${n}`,
-          })
-      } else {
-        const have = sel.get(id) ?? 0
-        if (have && node.max !== null && have > node.max)
-          issues.push({
-            ruleId: `item-max-${id}`,
-            severity: 'error',
-            scope: 'fighter',
-            targetUid: f.uid,
-            message: `${f.name} / ${node.name}: najwyżej ${node.max} szt., jest ${have}`,
-          })
-      }
-    }
-  }
+  for (const view of ctx.units) validateUnit(ctx, view, issues)
+  for (const force of ctx.roster.forces) validateForce(ctx, force, issues)
 
   return issues
 }
 
-// --- summaries used by the UI and the PDF ----------------------------------------------------
+function validateUnit(ctx: Ctx, view: UnitView, issues: Issue[]): void {
+  const label = view.unit.name
+  for (const node of view.nodes.values()) {
+    if (!isLive(view, node)) continue
+    const eff = ctx.effective(view, node)
+    if (eff.hidden) continue
 
-export type GearLine = { name: string; qty: number; cost: number; profiles: string[]; rules: string[] }
-
-/** Flat, printable list of what a fighter actually carries. */
-export function gearLines(pack: Pack, roster: Roster, fighter: Fighter): GearLine[] {
-  const type = fighterType(pack, roster.factionId, fighter.typeId)
-  if (!type) return []
-  const lines: GearLine[] = []
-  const sel = toMap(fighter.gear)
-  const walk = (nodes: LoadoutNode[]) => {
-    for (const n of nodes) {
-      if (n.k === 'i') {
-        const qty = sel.get(n.id) ?? 0
-        if (qty > 0) lines.push({ name: n.name, qty, cost: n.cost * qty, profiles: n.profiles, rules: n.rules })
-      }
-      walk(n.children ?? [])
+    for (const c of eff.cons) {
+      if (c.field !== 'selections') continue
+      const actual =
+        node.k === 'g' ? groupCount(view, node, view.tree, c.ics === true) : qtyOf(view, node)
+      // A group that holds nothing and demands nothing is simply an unopened section.
+      if (node.k === 'g' && actual === 0 && c.type === 'max') continue
+      if (c.type === 'min' && actual < c.value)
+        issues.push({
+          ruleId: `min:${node.path}:${c.id}`,
+          severity: 'error',
+          scope: 'unit',
+          targetUid: view.unit.uid,
+          message: `${label} / ${eff.name}: wymagane co najmniej ${c.value} ${picks(c.value)}, jest ${actual}`,
+        })
+      if (c.type === 'max' && actual > c.value)
+        issues.push({
+          ruleId: `max:${node.path}:${c.id}`,
+          severity: 'error',
+          scope: 'unit',
+          targetUid: view.unit.uid,
+          message: `${label} / ${eff.name}: najwyżej ${c.value} ${picks(c.value)}, jest ${actual}`,
+        })
     }
   }
-  walk(type.tree)
-  return lines
 }
 
-export function fighterSort(pack: Pack, roster: Roster) {
-  return (a: Fighter, b: Fighter) => {
-    const ca = categoryOf(pack, roster, a)
-    const cb = categoryOf(pack, roster, b)
-    const d = CATEGORY_ORDER.indexOf(ca!) - CATEGORY_ORDER.indexOf(cb!)
-    return d !== 0 ? d : roster.fighters.indexOf(a) - roster.fighters.indexOf(b)
+/** Force organisation: how many units of each category a detachment may hold. */
+export function forceSlots(
+  ctx: Ctx,
+  force: Force,
+): { slotId: Id; category: Id; name: string; min: number; max: number | null; actual: number }[] {
+  const template = findTemplate(ctx.pack, force.templateId)
+  if (!template?.slots) return []
+  const views = ctx.units.filter((u) => u.force === force)
+  return template.slots.map((slot) => {
+    let min = 0
+    let max: number | null = null
+    for (const c of slot.cons ?? []) {
+      if (c.field !== 'selections') continue
+      if (c.type === 'min') min = Math.max(min, c.value)
+      if (c.type === 'max') max = max === null ? c.value : Math.min(max, c.value)
+    }
+    const actual = views.filter((v) => categoriesOf(ctx, v).includes(slot.category)).length
+    return {
+      slotId: slot.id,
+      category: slot.category,
+      name: slot.name ?? categoryName(ctx.pack, slot.category),
+      min,
+      max,
+      actual,
+    }
+  })
+}
+
+function validateForce(ctx: Ctx, force: Force, issues: Issue[]): void {
+  for (const slot of forceSlots(ctx, force)) {
+    if (slot.actual < slot.min)
+      issues.push({
+        ruleId: `force-min:${force.uid}:${slot.slotId}`,
+        severity: 'error',
+        scope: 'force',
+        targetUid: force.uid,
+        message: `${force.name} / ${slot.name}: minimum ${slot.min}, jest ${slot.actual}`,
+      })
+    if (slot.max !== null && slot.actual > slot.max)
+      issues.push({
+        ruleId: `force-max:${force.uid}:${slot.slotId}`,
+        severity: 'error',
+        scope: 'force',
+        targetUid: force.uid,
+        message: `${force.name} / ${slot.name}: maksimum ${slot.max}, jest ${slot.actual}`,
+      })
   }
+
+  const template = findTemplate(ctx.pack, force.templateId)
+  for (const c of template?.cons ?? []) {
+    if (c.field !== 'forces') continue
+    const actual = force.forces.length
+    if (c.type === 'max' && actual > c.value)
+      issues.push({
+        ruleId: `force-count-max:${force.uid}:${c.id}`,
+        severity: 'error',
+        scope: 'force',
+        targetUid: force.uid,
+        message: `${force.name}: najwyżej ${c.value} pododdziałów, jest ${actual}`,
+      })
+    if (c.type === 'min' && actual < c.value)
+      issues.push({
+        ruleId: `force-count-min:${force.uid}:${c.id}`,
+        severity: 'error',
+        scope: 'force',
+        targetUid: force.uid,
+        message: `${force.name}: wymagane co najmniej ${c.value} pododdziałów, jest ${actual}`,
+      })
+  }
+
+  for (const child of force.forces) validateForce(ctx, child, issues)
+}
+
+export function findTemplate(pack: Pack, id: Id) {
+  const search = (list: Pack['forceTemplates']): Pack['forceTemplates'][number] | null => {
+    for (const t of list) {
+      if (t.id === id) return t
+      const hit = search(t.children ?? [])
+      if (hit) return hit
+    }
+    return null
+  }
+  return search(pack.forceTemplates)
+}
+
+// --- option availability -------------------------------------------------------------------------
+
+/** Why a node cannot be picked right now, or null when it can. */
+export function blockedReason(ctx: Ctx, view: UnitView, node: Node): string | null {
+  if (!isLive(view, node)) return 'wymaga wcześniejszego wyboru'
+  const eff = ctx.effective(view, node)
+  if (eff.hidden) return 'niedostępne'
+
+  const have = qtyOf(view, node)
+  for (const c of eff.cons) {
+    if (c.field !== 'selections' || c.type !== 'max') continue
+    if (have >= c.value) return c.value === 1 ? 'już wybrane' : `limit ${c.value} szt.`
+  }
+
+  const parent = node.ancestorNodes[0]
+  if (parent?.k === 'g') {
+    const parentEff = ctx.effective(view, parent)
+    for (const c of parentEff.cons) {
+      if (c.field !== 'selections' || c.type !== 'max') continue
+      const used = groupCount(view, parent, view.tree, c.ics === true)
+      if (used >= c.value) return `grupa pełna (${used}/${c.value})`
+    }
+  }
+  return null
+}
+
+/** Mandatory and unchangeable: the data fixes both ends of the range at the same value. */
+export function isGranted(ctx: Ctx, view: UnitView, node: Node): boolean {
+  if (node.k !== 'e') return false
+  const eff = ctx.effective(view, node)
+  const min = eff.cons.find((c) => c.type === 'min' && c.field === 'selections')?.value ?? 0
+  const max = eff.cons.find((c) => c.type === 'max' && c.field === 'selections')?.value ?? null
+  return min >= 1 && max === min
+}
+
+/** Everything the unit carries, flattened for a sheet. */
+export type GearLine = { name: string; qty: number; cost: number; prof: Id[]; rules: Id[]; depth: number }
+
+export function gearLines(ctx: Ctx, view: UnitView): GearLine[] {
+  const out: GearLine[] = []
+  const walk = (node: Node) => {
+    for (const child of view.tree.children(node)) {
+      const qty = view.selected.get(child.path) ?? 0
+      if (child.k === 'e' && qty > 0) {
+        const eff = ctx.effective(view, child)
+        out.push({
+          name: eff.name,
+          qty,
+          cost: (eff.cost[ctx.pack.primaryCost] ?? 0) * qty,
+          prof: child.prof,
+          rules: child.rules,
+          depth: child.ancestorNodes.length - 1,
+        })
+      }
+      if (child.k === 'g' || qty > 0) walk(child)
+    }
+  }
+  walk(view.root)
+  return out
+}
+
+/** Statline row, when the pack marks a profile type as one. */
+export function statlineOf(pack: Pack, profileIds: Id[]): { columns: string[]; values: string[] } | null {
+  const typeId = pack.statlineType
+  if (!typeId) return null
+  const profile = profileIds.map((id) => pack.profiles[id]).find((p) => p?.typeId === typeId)
+  if (!profile) return null
+  const columns = pack.profileTypes[typeId]?.columns ?? Object.keys(profile.chars)
+  return { columns, values: columns.map((c) => profile.chars[c] ?? '—') }
+}
+
+export function allUnits(roster: Roster): { unit: Roster['forces'][number]['units'][number]; force: Force }[] {
+  const out: { unit: Roster['forces'][number]['units'][number]; force: Force }[] = []
+  const walk = (f: Force) => {
+    for (const u of f.units) out.push({ unit: u, force: f })
+    f.forces.forEach(walk)
+  }
+  roster.forces.forEach(walk)
+  return out
 }

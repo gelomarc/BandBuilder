@@ -1,581 +1,494 @@
-// Converts BattleScribe .gst/.cat files into one BandBuilder data pack (src/data/swa.json).
+// Converts one system's BattleScribe data into a BandBuilder data pack.
 //
-// The BattleScribe model is a generic tree of selectionEntry / selectionEntryGroup nodes wired
-// together by entryLink references, with limits expressed as constraints and dynamic limits as
-// modifiers driven by repeats. This importer resolves all links into a plain nested tree, keeps
-// only the constraint shapes the game actually uses, and reports everything it could not map.
-import { XMLParser } from 'fast-xml-parser'
+//   node tools/import-bsdata.mjs swa
+//   node tools/import-bsdata.mjs hh3
+//
+// The BattleScribe model is a graph: selection entries and groups wired together by entry links,
+// with limits as constraints and dynamic limits as modifiers driven by conditions and repeats.
+// Shadow War is small enough that the graph could be flattened; Horus Heresy is not — 18 MB of
+// source that shares aggressively would explode into hundreds of megabytes — so the pack keeps the
+// links and the engine resolves them while walking. Everything that cannot be mapped is reported
+// rather than dropped in silence.
 import fs from 'node:fs'
 import path from 'node:path'
+import { loadDocuments } from './bs-normalize.mjs'
+import { requireSystem, SYSTEMS } from './systems.mjs'
 
-const SRC = 'data/bsdata'
-const OUT = 'src/data/swa.json'
-const REPORT = 'data/IMPORT-REPORT.md'
-const MAX_DEPTH = 8
+const report = { unmapped: new Map(), notes: [], warnings: new Map() }
+const count = (map, msg) => map.set(msg, (map.get(msg) ?? 0) + 1)
+const unmapped = (msg) => count(report.unmapped, msg)
+const warn = (msg) => count(report.warnings, msg)
 
-const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@' })
-const arr = (x) => (x === undefined || x === null || x === '' ? [] : Array.isArray(x) ? x : [x])
-const num = (v) => (v === undefined || v === null ? null : Number(v))
-const report = { unmapped: [], notes: [], warnings: [] }
-const warn = (msg) => {
-  if (!report.warnings.includes(msg)) report.warnings.push(msg)
-}
-const unmapped = (msg) => {
-  if (!report.unmapped.includes(msg)) report.unmapped.push(msg)
-}
-
-// ---------------------------------------------------------------------------------------------
-// parsing / indexing
-// ---------------------------------------------------------------------------------------------
-
-function load(file) {
-  const doc = parser.parse(fs.readFileSync(path.join(SRC, file), 'utf8'))
-  return doc.gameSystem || doc.catalogue
-}
-
-/** Index every addressable node of a document by its id, so entryLinks can be resolved. */
-function index(doc, into = { entries: {}, groups: {}, profiles: {}, rules: {}, categories: {} }) {
-  const walkEntry = (e) => {
-    into.entries[e['@id']] = e
-    arr(e.selectionEntries?.selectionEntry).forEach(walkEntry)
-    arr(e.selectionEntryGroups?.selectionEntryGroup).forEach(walkGroup)
-    arr(e.profiles?.profile).forEach((p) => (into.profiles[p['@id']] = p))
-    arr(e.rules?.rule).forEach((r) => (into.rules[r['@id']] = r))
+const list = (x) => (Array.isArray(x) ? x : [])
+const clean = (obj) => {
+  for (const k of Object.keys(obj)) {
+    const v = obj[k]
+    if (v === undefined || v === null || v === '' || v === false || (Array.isArray(v) && !v.length)) delete obj[k]
   }
-  const walkGroup = (g) => {
-    into.groups[g['@id']] = g
-    arr(g.selectionEntries?.selectionEntry).forEach(walkEntry)
-    arr(g.selectionEntryGroups?.selectionEntryGroup).forEach(walkGroup)
+  return obj
+}
+
+// --- pieces of an entry ------------------------------------------------------------------------
+
+const costsOf = (node) => {
+  const out = {}
+  for (const c of list(node.costs)) {
+    const id = c.typeId ?? c.costTypeId
+    if (!id) continue
+    const value = Number(c.value)
+    if (value) out[id] = value
   }
-  arr(doc.sharedSelectionEntries?.selectionEntry).forEach(walkEntry)
-  arr(doc.selectionEntries?.selectionEntry).forEach(walkEntry)
-  arr(doc.sharedSelectionEntryGroups?.selectionEntryGroup).forEach(walkGroup)
-  arr(doc.sharedProfiles?.profile).forEach((p) => (into.profiles[p['@id']] = p))
-  arr(doc.profiles?.profile).forEach((p) => (into.profiles[p['@id']] = p))
-  arr(doc.sharedRules?.rule).forEach((r) => (into.rules[r['@id']] = r))
-  arr(doc.rules?.rule).forEach((r) => (into.rules[r['@id']] = r))
-  arr(doc.categoryEntries?.categoryEntry).forEach((c) => (into.categories[c['@id']] = c['@name']))
-  return into
+  return Object.keys(out).length ? out : undefined
 }
 
-// ---------------------------------------------------------------------------------------------
-// costs, constraints, profiles, rules
-// ---------------------------------------------------------------------------------------------
+const CONSTRAINT_TYPES = new Set(['min', 'max'])
 
-const costOf = (node) => {
-  const c = arr(node?.costs?.cost).find((x) => x['@name'] === 'pts' || x['@costTypeId'] === 'Points')
-  return c ? Number(c['@value']) : null
-}
-
-/**
- * Pull the two constraint shapes the game uses out of a node: a min and a max on the number of
- * selections, counted against the immediate parent. Anything else is reported, not silently lost.
- */
-function limits(nodes, where) {
-  let min = null
-  let max = null
-  for (const node of nodes) {
-    for (const c of arr(node?.constraints?.constraint)) {
-      const field = c['@field']
-      const type = c['@type']
-      const value = Number(c['@value'])
-      if (field === 'selections' && (type === 'min' || type === 'max')) {
-        if (type === 'min') min = min === null ? value : Math.max(min, value)
-        else max = max === null ? value : Math.min(max, value)
-      } else {
-        unmapped(`constraint ${type}/${field} @${c['@scope']} = ${c['@value']} (${where})`)
-      }
-    }
-  }
-  return { min, max }
-}
-
-const STAT_IDS = ['M', 'WS', 'BS', 'S', 'T', 'W', 'I', 'A', 'Ld']
-
-function readProfile(p) {
-  const chars = {}
-  for (const c of arr(p.characteristics?.characteristic)) chars[c['@name']] = String(c['@value'] ?? '')
-  return { id: p['@id'], name: p['@name'], typeId: p['@profileTypeId'], typeName: p['@profileTypeName'], chars }
-}
-
-const isStatProfile = (p) => STAT_IDS.every((s) => p.chars[s] !== undefined)
-
-/** Campaign progression subtrees, kept out of the gear tree. */
-const isAdvancement = (n) => n.k === 'g' && /^(skills|advance attributes)$/i.test(n.name)
-
-// ---------------------------------------------------------------------------------------------
-// tree resolution
-// ---------------------------------------------------------------------------------------------
-
-/**
- * Resolve the children of a BattleScribe container into BandBuilder nodes.
- * Node ids are made unique per position (link id when present) so a roster can address the
- * same shared weapon appearing in two different slots.
- */
-function resolveChildren(container, ctx, depth, seen) {
-  if (depth > MAX_DEPTH) {
-    warn(`tree deeper than ${MAX_DEPTH} levels, truncated`)
-    return []
-  }
+function constraintsOf(node, where) {
   const out = []
-  for (const e of arr(container.selectionEntries?.selectionEntry)) {
-    const n = itemNode(e, null, ctx, depth, seen)
-    if (n) out.push(n)
-  }
-  for (const g of arr(container.selectionEntryGroups?.selectionEntryGroup)) {
-    const n = groupNode(g, null, ctx, depth, seen)
-    if (n) out.push(n)
-  }
-  for (const l of arr(container.entryLinks?.entryLink)) {
-    const id = l['@targetId']
-    if (l['@type'] === 'selectionEntryGroup') {
-      const t = ctx.idx.groups[id]
-      if (!t) {
-        unmapped(`unresolved group link ${id} in ${ctx.faction}`)
-        continue
-      }
-      const n = groupNode(t, l, ctx, depth, seen)
-      if (n) out.push(n)
-    } else {
-      const t = ctx.idx.entries[id]
-      if (!t) {
-        unmapped(`unresolved entry link ${id} in ${ctx.faction}`)
-        continue
-      }
-      const n = itemNode(t, l, ctx, depth, seen)
-      if (n) out.push(n)
+  for (const c of list(node.constraints)) {
+    if (!CONSTRAINT_TYPES.has(c.type)) {
+      unmapped(`constraint type "${c.type}"`)
+      continue
     }
-  }
-  return out
-}
-
-function collectInfo(node, ctx) {
-  const profileIds = []
-  const ruleIds = []
-  for (const p of arr(node.profiles?.profile)) {
-    const prof = readProfile(p)
-    ctx.pack.profiles[prof.id] = prof
-    profileIds.push(prof.id)
-  }
-  for (const r of arr(node.rules?.rule)) {
-    ctx.pack.rules[r['@id']] = { id: r['@id'], name: r['@name'], text: String(r.description ?? '') }
-    ruleIds.push(r['@id'])
-  }
-  for (const l of arr(node.infoLinks?.infoLink)) {
-    const id = l['@targetId']
-    if (l['@type'] === 'profile') {
-      const p = ctx.idx.profiles[id]
-      if (!p) {
-        unmapped(`unresolved profile link ${id} in ${ctx.faction}`)
-        continue
-      }
-      const prof = readProfile(p)
-      ctx.pack.profiles[prof.id] = prof
-      profileIds.push(prof.id)
-    } else if (l['@type'] === 'rule') {
-      const r = ctx.idx.rules[id]
-      if (!r) {
-        unmapped(`unresolved rule link ${id} in ${ctx.faction}`)
-        continue
-      }
-      ctx.pack.rules[id] = { id, name: r['@name'], text: String(r.description ?? '') }
-      ruleIds.push(id)
-    } else {
-      unmapped(`infoLink type ${l['@type']}`)
-    }
-  }
-  return { profileIds, ruleIds }
-}
-
-function itemNode(entry, link, ctx, depth, seen) {
-  if (entry['@hidden'] === 'true' || link?.['@hidden'] === 'true') return null
-  const key = entry['@id']
-  if (seen.has(key)) {
-    warn(`cycle broken at entry ${entry['@name']} (${key})`)
-    return null
-  }
-  const nextSeen = new Set(seen).add(key)
-  const { min, max } = limits([link, entry], `item ${entry['@name']}`)
-  const { profileIds, ruleIds } = collectInfo(entry, ctx)
-  const children = [
-    ...resolveChildren(entry, ctx, depth + 1, nextSeen),
-    ...(link ? resolveChildren(link, ctx, depth + 1, nextSeen) : []),
-  ]
-  const node = {
-    k: 'i',
-    id: link?.['@id'] || entry['@id'],
-    ref: entry['@id'],
-    name: entry['@name'],
-    cost: costOf(link) ?? costOf(entry) ?? 0,
-    min,
-    max,
-    profiles: profileIds,
-    rules: ruleIds,
-    children,
-  }
-  const stat = statAdvance(entry['@name'])
-  if (stat) node.effect = stat
-  return node
-}
-
-/** The campaign advancement entries are plain text ("+1 Ballistic Skill"); read them as deltas. */
-const ADVANCE_STATS = {
-  move: 'M',
-  'weapon skill': 'WS',
-  'ballistic skill': 'BS',
-  strength: 'S',
-  toughness: 'T',
-  wound: 'W',
-  wounds: 'W',
-  initiative: 'I',
-  attack: 'A',
-  attacks: 'A',
-  leadership: 'Ld',
-}
-function statAdvance(name) {
-  const m = /^([+-])(\d+)\s+(.+)$/.exec(String(name || '').trim())
-  if (!m) return null
-  const stat = ADVANCE_STATS[m[3].toLowerCase()]
-  if (!stat) return null
-  return { stat, delta: (m[1] === '-' ? -1 : 1) * Number(m[2]) }
-}
-
-function groupNode(group, link, ctx, depth, seen) {
-  if (group['@hidden'] === 'true' || link?.['@hidden'] === 'true') return null
-  const key = group['@id']
-  if (seen.has(key)) {
-    warn(`cycle broken at group ${group['@name']} (${key})`)
-    return null
-  }
-  const nextSeen = new Set(seen).add(key)
-  const { min, max } = limits([link, group], `group ${group['@name']}`)
-  const children = resolveChildren(group, ctx, depth + 1, nextSeen)
-  if (!children.length) return null
-  return {
-    k: 'g',
-    id: link?.['@id'] || group['@id'],
-    name: group['@name'],
-    min,
-    max,
-    children,
-  }
-}
-
-// ---------------------------------------------------------------------------------------------
-// band rules from a forceEntry
-// ---------------------------------------------------------------------------------------------
-
-const CATEGORIES = [
-  { id: 'leader', name: 'Leader' },
-  { id: 'specialist', name: 'Specialists' },
-  { id: 'trooper', name: 'Troopers' },
-  { id: 'recruit', name: 'New Recruits' },
-  { id: 'operative', name: 'Special Operatives' },
-]
-
-/**
- * Category names differ per catalogue ("Leader" / "Kill Team Leader", "Trooper" / "Troopers" /
- * "Tooper", Tau "Drone"), so match on shape rather than on an exact string. Order matters:
- * "Special Operative" must be tested before "Specialist".
- */
-function canonCategory(name) {
-  const n = String(name || '').toLowerCase()
-  if (/leader/.test(n)) return 'leader'
-  if (/special\s*operative/.test(n) || /drone/.test(n)) return 'operative'
-  if (/specialist/.test(n)) return 'specialist'
-  if (/recruit/.test(n)) return 'recruit'
-  if (/t[o]+per/.test(n) || /trooper/.test(n) || /ganger/.test(n)) return 'trooper'
-  return null
-}
-
-/**
- * Turn a forceEntry into declarative band rules. The two dynamic limits in this game (each
- * Special Operative raises the min and max fighter count by one) are expressed in BattleScribe
- * as modifiers whose repeat counts selections of a category; that becomes an `adjust` entry.
- */
-function bandRules(force, categories, label = '') {
-  const rules = []
-  const byConstraintId = {}
-
-  // A few catalogues carry two max constraints on the model count, one of which duplicates the
-  // minimum (Ork Boyz declares max 20 and max 3 next to min 3). A max that is not above the
-  // minimum cannot be the intended limit, so drop it and say so in the report.
-  const raw = arr(force.constraints?.constraint).filter((c) => {
-    if (c['@field'] === 'selections') return true
-    unmapped(`force constraint field ${c['@field']}`)
-    return false
-  })
-  const maxes = raw.filter((c) => c['@type'] === 'max')
-  const keptMax = maxes.length ? maxes.reduce((a, b) => (Number(a['@value']) >= Number(b['@value']) ? a : b)) : null
-  if (maxes.length > 1)
-    warn(
-      `${label}: ${maxes.length} max constraints on model count (${maxes
-        .map((c) => c['@value'])
-        .join(', ')}), kept ${keptMax['@value']}`,
+    out.push(
+      clean({
+        id: c.id,
+        type: c.type,
+        field: c.field,
+        scope: c.scope ?? 'parent',
+        value: Number(c.value),
+        pct: c.percentValue === true,
+        ics: c.includeChildSelections === true,
+        icf: c.includeChildForces === true,
+      }),
     )
-  for (const c of raw) {
-    if (c['@type'] === 'max' && c !== keptMax) continue
-    const rule = {
-      id: c['@type'] === 'min' ? 'min-fighters' : 'max-fighters',
-      type: c['@type'],
-      count: 'fighters',
-      value: Number(c['@value']),
-      adjust: [],
-    }
-    byConstraintId[c['@id']] = rule
-    rules.push(rule)
+    if (c.field !== 'selections' && c.field !== 'forces' && !c.field?.includes('-') && !String(c.field).startsWith('limit::'))
+      unmapped(`constraint field "${c.field}" (${where})`)
   }
-
-  for (const m of arr(force.modifiers?.modifier)) {
-    const target = byConstraintId[m['@field']]
-    const rep = arr(m.repeats?.repeat)[0]
-    if (!target || !rep || m['@type'] !== 'increment') {
-      unmapped(`force modifier ${m['@type']} on ${m['@field']}`)
-      continue
-    }
-    const cat = canonCategory(categories[rep['@childId']])
-    if (!cat) {
-      unmapped(`force modifier repeats over unknown category ${rep['@childId']}`)
-      continue
-    }
-    target.adjust.push({ perFighterWhere: { category: cat }, delta: Number(m['@value']) })
-  }
-
-  for (const cl of arr(force.categoryLinks?.categoryLink)) {
-    const cat = canonCategory(categories[cl['@targetId']])
-    if (!cat) continue
-    for (const c of arr(cl.constraints?.constraint)) {
-      const percent = c['@percentValue'] === 'true'
-      if (c['@field'] === 'selections') {
-        // A percentage on a selection count means "at most half the models", not "at most 50".
-        rules.push({
-          id: `${c['@type']}-${cat}`,
-          type: c['@type'],
-          count: 'fighters',
-          where: { category: cat },
-          value: Number(c['@value']),
-          unit: percent ? 'percentOfCount' : 'absolute',
-          adjust: [],
-        })
-      } else if (String(c['@field']).startsWith('limit::') || percent) {
-        rules.push({
-          id: `${c['@type']}-cost-${cat}`,
-          type: c['@type'],
-          count: 'cost',
-          where: { category: cat },
-          value: Number(c['@value']),
-          unit: percent ? 'percentOfBudget' : 'absolute',
-          adjust: [],
-        })
-      } else {
-        unmapped(`category constraint ${c['@type']}/${c['@field']} on ${cat}`)
-      }
-    }
-  }
-  return rules
+  return out.length ? out : undefined
 }
 
-// ---------------------------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------------------------
+const CONDITION_TYPES = new Set([
+  'instanceOf',
+  'notInstanceOf',
+  'atLeast',
+  'atMost',
+  'equalTo',
+  'notEqualTo',
+  'greaterThan',
+  'lessThan',
+])
 
-const files = fs.readdirSync(SRC)
-const gstFile = files.find((f) => f.endsWith('.gst'))
-if (!gstFile) throw new Error(`no .gst in ${SRC}`)
-const gst = load(gstFile)
-const gstIdx = index(gst)
-
-const pack = {
-  schema: 'bandbuilder/datapack@1',
-  id: 'swa',
-  name: gst['@name'],
-  version: `bsdata-r${gst['@revision']}`,
-  source: {
-    repo: 'https://github.com/BSData/wh40k-shadow-war-armageddon',
-    note: 'Community BattleScribe data, not endorsed by Games Workshop. Imported by tools/import-bsdata.mjs.',
-  },
-  vocabulary: {
-    band: 'Kill Team',
-    fighter: 'Wojownik',
-    fighterAcc: 'wojownika',
-    currency: 'pts',
-    campaignCurrency: 'Promethium Cache',
-  },
-  budget: { default: 1000 },
-  statline: STAT_IDS,
-  categories: CATEGORIES,
-  profileTypes: {},
-  profiles: {},
-  rules: {},
-  factions: [],
+function conditionOf(c) {
+  if (!CONDITION_TYPES.has(c.type)) {
+    unmapped(`condition type "${c.type}"`)
+    return null
+  }
+  return clean({
+    type: c.type,
+    field: c.field,
+    scope: c.scope ?? 'parent',
+    childId: c.childId,
+    value: Number(c.value),
+    ics: c.includeChildSelections === true,
+    icf: c.includeChildForces === true,
+  })
 }
 
-for (const pt of arr(gst.profileTypes?.profileType)) {
-  pack.profileTypes[pt['@id']] = {
-    id: pt['@id'],
-    name: pt['@name'],
-    columns: arr(pt.characteristicTypes?.characteristicType).map((c) => c['@name']),
-  }
+function conditionGroupOf(g) {
+  const conds = list(g.conditions).map(conditionOf).filter(Boolean)
+  const groups = list(g.conditionGroups).map(conditionGroupOf).filter(Boolean)
+  if (!conds.length && !groups.length) return null
+  return clean({ type: g.type === 'or' ? 'or' : 'and', conds, groups })
 }
 
-for (const file of files.filter((f) => f.endsWith('.cat')).sort()) {
-  const cat = load(file)
-  const idx = index(cat, index(gst)) // catalogue definitions win over game system ones
-  for (const pt of arr(cat.profileTypes?.profileType)) {
-    if (!pack.profileTypes[pt['@id']])
-      pack.profileTypes[pt['@id']] = {
-        id: pt['@id'],
-        name: pt['@name'],
-        columns: arr(pt.characteristicTypes?.characteristicType).map((c) => c['@name']),
-      }
+const MODIFIER_TYPES = new Set([
+  'set',
+  'increment',
+  'decrement',
+  'ceil',
+  'floor',
+  'append',
+  'prepend',
+  'replace',
+  'add',
+  'remove',
+  'set-primary',
+  'unset-primary',
+])
+
+function modifiersOf(node, where) {
+  const out = []
+  const push = (m) => {
+    if (!MODIFIER_TYPES.has(m.type)) {
+      unmapped(`modifier type "${m.type}" (${where})`)
+      return
+    }
+    const conds = list(m.conditions).map(conditionOf).filter(Boolean)
+    const groups = list(m.conditionGroups).map(conditionGroupOf).filter(Boolean)
+    const reps = list(m.repeats)
+      .map((r) =>
+        clean({
+          field: r.field,
+          scope: r.scope ?? 'parent',
+          childId: r.childId,
+          value: Number(r.value),
+          repeats: Number(r.repeats ?? 1),
+          roundUp: r.roundUp === true,
+          ics: r.includeChildSelections === true,
+          icf: r.includeChildForces === true,
+        }),
+      )
+      .filter((r) => r.field)
+    out.push(clean({ type: m.type, field: m.field, value: m.value, conds, groups, reps }))
+  }
+  for (const m of list(node.modifiers)) push(m)
+  // Modifier groups are just a shared condition wrapper; flatten them onto their children.
+  for (const g of list(node.modifierGroups)) {
+    const shared = { conditions: list(g.conditions), conditionGroups: list(g.conditionGroups) }
+    for (const m of list(g.modifiers))
+      push({
+        ...m,
+        conditions: [...shared.conditions, ...list(m.conditions)],
+        conditionGroups: [...shared.conditionGroups, ...list(m.conditionGroups)],
+      })
+    if (list(g.modifierGroups).length) unmapped('nested modifierGroup')
+  }
+  return out.length ? out : undefined
+}
+
+// --- profiles, rules, categories ---------------------------------------------------------------
+
+function collectInfo(node, pack, idx) {
+  const profs = []
+  const rules = []
+
+  const addProfile = (p) => {
+    const chars = {}
+    for (const c of list(p.characteristics)) {
+      const value = String(c.value ?? '').trim()
+      if (value) chars[c.name] = value
+    }
+    pack.profiles[p.id] = clean({ id: p.id, name: p.name, typeId: p.typeId ?? p.profileTypeId, chars })
+    profs.push(p.id)
+  }
+  const addRule = (r) => {
+    pack.rules[r.id] = clean({ id: r.id, name: r.name, text: String(r.description ?? '').trim() })
+    rules.push(r.id)
   }
 
-  const faction = {
-    id: cat['@name'].toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-    name: cat['@name'],
-    book: cat['@book'] || 'Shadow War: Armageddon',
-    bandRules: [],
-    bandOptions: [],
-    fighters: [],
+  for (const p of list(node.profiles)) addProfile(p)
+  for (const r of list(node.rules)) addRule(r)
+  for (const l of list(node.infoLinks)) {
+    if (l.type === 'profile') {
+      const p = idx.profiles.get(l.targetId)
+      if (p) addProfile({ ...p, id: p.id })
+      else unmapped('unresolved profile link')
+    } else if (l.type === 'rule') {
+      const r = idx.rules.get(l.targetId)
+      if (r) addRule(r)
+      else unmapped('unresolved rule link')
+    } else if (l.type === 'infoGroup') {
+      const g = idx.infoGroups.get(l.targetId)
+      if (g) {
+        const inner = collectInfo(g, pack, idx)
+        profs.push(...inner.profs)
+        rules.push(...inner.rules)
+      } else unmapped('unresolved infoGroup link')
+    } else {
+      unmapped(`infoLink type "${l.type}"`)
+    }
   }
-  const ctx = { idx, pack, faction: faction.name }
+  return { profs, rules }
+}
 
-  // Some catalogues carry a complete forceEntry, others leave parts of it empty and rely on the
-  // game system's. Merge by rule id with the catalogue winning, so faction deviations (Orks 3-20
-  // models, Guard 3 specialists) survive without losing the shared baseline.
-  const merged = new Map()
-  for (const r of bandRules(arr(gst.forceEntries?.forceEntry)[0], index(gst).categories, 'game system')) merged.set(r.id, r)
-  const catForce = arr(cat.forceEntries?.forceEntry)[0]
-  if (catForce) for (const r of bandRules(catForce, idx.categories, faction.name)) merged.set(r.id, r)
-  faction.bandRules = [...merged.values()]
+function categoriesOf(node) {
+  const cats = []
+  let primary
+  for (const c of list(node.categoryLinks)) {
+    cats.push(c.targetId)
+    if (c.primary === true) primary = c.targetId
+  }
+  return { cats: cats.length ? cats : undefined, primary }
+}
 
-  // Fighter types are the catalogue's selectable roots: root entryLinks plus root entries.
-  const roots = [
-    ...arr(cat.entryLinks?.entryLink).map((l) => ({
-      link: l,
-      target: l['@type'] === 'selectionEntryGroup' ? null : idx.entries[l['@targetId']],
-    })),
-    ...arr(cat.selectionEntries?.selectionEntry).map((e) => ({ link: null, target: e })),
-  ]
+// --- nodes -------------------------------------------------------------------------------------
 
-  for (const { link, target } of roots) {
-    if (!target) {
-      unmapped(`root link of type selectionEntryGroup skipped in ${faction.name}`)
-      continue
+/**
+ * Convert one selection entry or group. Children stay as links wherever the source used a link, so
+ * the pack keeps the source's sharing instead of inlining a copy per use site.
+ */
+function nodeOf(src, isGroup, pack, idx) {
+  const { profs, rules } = collectInfo(src, pack, idx)
+  const { cats, primary } = categoriesOf(src)
+  return clean({
+    id: src.id,
+    name: String(src.name ?? '').trim(),
+    k: isGroup ? 'g' : 'e',
+    t: isGroup ? undefined : (src.type ?? 'upgrade'),
+    cost: costsOf(src),
+    cats,
+    primary,
+    cons: constraintsOf(src, src.name),
+    mods: modifiersOf(src, src.name),
+    prof: profs.length ? profs : undefined,
+    rules: rules.length ? rules : undefined,
+    kids: childrenOf(src, pack, idx),
+    hidden: src.hidden === true,
+    def: src.defaultSelectionEntryId,
+    coll: src.collective === true,
+  })
+}
+
+/** A link to a shared node, carrying whatever the link overrides. */
+function linkOf(l, pack, idx) {
+  const { profs, rules } = collectInfo(l, pack, idx)
+  const { cats, primary } = categoriesOf(l)
+  return clean({
+    link: l.targetId,
+    id: l.id,
+    name: l.name && !/^New (Entry|Info)Link$/.test(l.name) ? String(l.name).trim() : undefined,
+    cost: costsOf(l),
+    cats,
+    primary,
+    cons: constraintsOf(l, l.name),
+    mods: modifiersOf(l, l.name),
+    prof: profs.length ? profs : undefined,
+    rules: rules.length ? rules : undefined,
+    kids: childrenOf(l, pack, idx),
+    hidden: l.hidden === true,
+  })
+}
+
+function childrenOf(src, pack, idx) {
+  const kids = []
+  for (const e of list(src.selectionEntries)) kids.push(nodeOf(e, false, pack, idx))
+  for (const g of list(src.selectionEntryGroups)) kids.push(nodeOf(g, true, pack, idx))
+  for (const l of list(src.entryLinks)) kids.push(linkOf(l, pack, idx))
+  return kids.length ? kids : undefined
+}
+
+// --- force templates ---------------------------------------------------------------------------
+
+function forceTemplateOf(f) {
+  return clean({
+    id: f.id,
+    name: String(f.name ?? '').trim(),
+    cons: constraintsOf(f, f.name),
+    mods: modifiersOf(f, f.name),
+    slots: list(f.categoryLinks).map((c) =>
+      clean({
+        id: c.id,
+        category: c.targetId,
+        name: c.name,
+        cons: constraintsOf(c, `${f.name}/${c.name}`),
+        mods: modifiersOf(c, `${f.name}/${c.name}`),
+      }),
+    ),
+    children: list(f.forceEntries).map(forceTemplateOf),
+  })
+}
+
+// --- main --------------------------------------------------------------------------------------
+
+function importSystem(systemId) {
+  const system = requireSystem(systemId)
+  const dir = path.join('data/bsdata', system.id)
+  if (!fs.existsSync(dir)) {
+    console.error(`${system.id}: brak ${dir}. Uruchom: npm run fetch-data ${system.id}`)
+    process.exitCode = 1
+    return null
+  }
+
+  report.unmapped.clear()
+  report.warnings.clear()
+  report.notes.length = 0
+
+  const docs = loadDocuments(dir, system.format)
+  const gameSystem = docs.find((d) => d.isGameSystem)
+  if (!gameSystem) throw new Error(`${system.id}: brak pliku systemu gry`)
+
+  // Index every addressable definition across all documents. Ids are globally unique in
+  // BattleScribe, so catalogueLinks (one catalogue importing another) need no special handling:
+  // one shared pool covers them.
+  const idx = { entries: new Map(), groups: new Map(), profiles: new Map(), rules: new Map(), infoGroups: new Map() }
+  const walkDefinitions = (node) => {
+    for (const e of list(node.selectionEntries)) {
+      idx.entries.set(e.id, e)
+      walkDefinitions(e)
     }
-    if (target['@hidden'] === 'true') continue
+    for (const g of list(node.selectionEntryGroups)) {
+      idx.groups.set(g.id, g)
+      walkDefinitions(g)
+    }
+    for (const p of list(node.profiles)) idx.profiles.set(p.id, p)
+    for (const r of list(node.rules)) idx.rules.set(r.id, r)
+    for (const l of list(node.entryLinks)) walkDefinitions(l)
+  }
+  for (const { doc } of docs) {
+    for (const e of list(doc.sharedSelectionEntries)) {
+      idx.entries.set(e.id, e)
+      walkDefinitions(e)
+    }
+    for (const g of list(doc.sharedSelectionEntryGroups)) {
+      idx.groups.set(g.id, g)
+      walkDefinitions(g)
+    }
+    for (const p of [...list(doc.sharedProfiles), ...list(doc.profiles)]) idx.profiles.set(p.id, p)
+    for (const r of [...list(doc.sharedRules), ...list(doc.rules)]) idx.rules.set(r.id, r)
+    for (const g of list(doc.sharedInfoGroups)) idx.infoGroups.set(g.id, g)
+    walkDefinitions(doc)
+  }
 
-    const catLinks = arr(link?.categoryLinks?.categoryLink).concat(arr(target.categoryLinks?.categoryLink))
-    const primary = catLinks.find((c) => c['@primary'] === 'true') || catLinks[0]
-    let categoryId = primary ? canonCategory(idx.categories[primary['@targetId']]) : null
+  const pack = {
+    schema: 'bandbuilder/datapack@2',
+    id: system.id,
+    name: gameSystem.doc.name,
+    version: `bsdata-r${gameSystem.doc.revision ?? 0}`,
+    source: {
+      repo: `https://github.com/${system.repo}`,
+      note: 'Dane społecznościowe BattleScribe, bez autoryzacji Games Workshop. Import: tools/import-bsdata.mjs.',
+    },
+    vocabulary: system.vocabulary,
+    campaign: system.campaign,
+    budget: { default: system.budget },
+    costTypes: [],
+    primaryCost: null,
+    categories: [],
+    profileTypes: {},
+    profiles: {},
+    rules: {},
+    forceTemplates: [],
+    nodes: {},
+    factions: [],
+  }
 
-    const node = itemNode(target, link, ctx, 0, new Set())
-    if (!node) continue
+  for (const c of list(gameSystem.doc.costTypes))
+    pack.costTypes.push(clean({ id: c.id, name: c.name, hidden: c.hidden === true }))
+  pack.primaryCost = (pack.costTypes.find((c) => !c.hidden) ?? pack.costTypes[0])?.id ?? null
 
-    const statProfile = node.profiles.map((id) => pack.profiles[id]).find(isStatProfile)
+  for (const { doc } of docs)
+    for (const pt of list(doc.profileTypes))
+      if (!pack.profileTypes[pt.id])
+        pack.profileTypes[pt.id] = { id: pt.id, name: pt.name, columns: list(pt.characteristicTypes).map((c) => c.name) }
+  // Only a system with one universal model line gets a compact statline row; Horus Heresy has a
+  // dozen (Profile, Vehicle, Knight, Titan parts...), so there it stays a table like any other.
+  pack.statlineType = Object.values(pack.profileTypes).find((t) => t.name === 'Model')?.id
 
-    if (!categoryId) {
-      // An uncategorised root is either a model the catalogue forgot to tag (it has a statline,
-      // and in this game an untagged model is always a Special Operative) or a band-wide choice
-      // such as Chapter / Regiment / Clan, which belongs to the band, not to a fighter.
-      if (target['@type'] === 'model' && statProfile) {
-        categoryId = 'operative'
-        report.notes.push(`${faction.name}: "${node.name}" untagged, treated as Special Operative`)
-      } else {
-        faction.bandOptions.push({ ...node, k: 'g', children: node.children })
-        report.notes.push(`${faction.name}: "${node.name}" treated as a band-wide option`)
-        continue
+  const seenCategory = new Set()
+  for (const { doc } of docs)
+    for (const c of list(doc.categoryEntries))
+      if (!seenCategory.has(c.id)) {
+        seenCategory.add(c.id)
+        pack.categories.push(clean({ id: c.id, name: String(c.name ?? '').trim(), hidden: c.hidden === true }))
       }
-    }
 
-    // A root without a statline is not a fighter, whatever its category says. Adepta Sororitas
-    // tags "Seraphim" (an upgrade that swaps a Sister's loadout) as a roster entry; emitting it as
-    // a fighter type would produce a model with no profile.
-    if (!statProfile) {
-      report.notes.push(`${faction.name}: skipped "${node.name}" — a ${target['@type']} with no statline`)
+  pack.forceTemplates = list(gameSystem.doc.forceEntries).map(forceTemplateOf)
+
+  // Shared definitions become the addressable node pool.
+  for (const [id, src] of idx.entries) pack.nodes[id] = nodeOf(src, false, pack, idx)
+  for (const [id, src] of idx.groups) pack.nodes[id] = nodeOf(src, true, pack, idx)
+
+  // Each catalogue contributes the roots a player can actually pick.
+  for (const { doc, isGameSystem } of docs) {
+    const roots = [
+      ...list(doc.entryLinks).map((l) => linkOf(l, pack, idx)),
+      ...list(doc.selectionEntries).map((e) => nodeOf(e, false, pack, idx)),
+    ].filter((r) => !r.hidden)
+    if (!roots.length) continue
+    if (isGameSystem && roots.length < 3) {
+      report.notes.push(`${doc.name}: ${roots.length} korzeni w pliku systemu, pominięte jako frakcja`)
       continue
     }
-    // A handful of entries in the community data have blank characteristics. Show them as "?"
-    // rather than as an empty cell, and list them in the report so they can be filled in by hand.
-    const statline = {}
-    for (const s of STAT_IDS) {
-      const value = String(statProfile.chars[s] ?? '').trim()
-      statline[s] = value || '?'
-      if (!value) unmapped(`blank ${s} for ${faction.name} / ${node.name}`)
-    }
-
-    faction.fighters.push({
-      id: `${faction.id}--${node.ref}`,
-      name: node.name,
-      categoryId,
-      cost: node.cost,
-      max: node.max,
-      statline,
-      profiles: node.profiles.filter((id) => pack.profiles[id] !== statProfile),
-      rules: node.rules,
-      // Skill trees and attribute advances are campaign progression, not list building, so keep
-      // them apart from the gear tree; the app shows them on the fighter's campaign tab.
-      tree: node.children.filter((n) => !isAdvancement(n)),
-      advances: node.children.filter(isAdvancement),
+    pack.factions.push({
+      id: String(doc.name)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, ''),
+      name: String(doc.name).replace(/^[IVXLC]+\s*-\s*/, '').trim(),
+      library: doc.library === true,
+      roots,
     })
   }
 
-  faction.fighters.sort((a, b) => {
-    const order = ['leader', 'specialist', 'trooper', 'recruit', 'operative']
-    const d = order.indexOf(a.categoryId) - order.indexOf(b.categoryId)
-    return d !== 0 ? d : b.cost - a.cost
-  })
-  pack.factions.push(faction)
+  return { system, pack }
+}
+
+// --- output ------------------------------------------------------------------------------------
+
+const ids = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(SYSTEMS)
+const summaries = []
+
+for (const id of ids) {
+  const result = importSystem(id)
+  if (!result) continue
+  const { system, pack } = result
+
+  const out = path.join('src/data', `${system.id}.json`)
+  fs.mkdirSync(path.dirname(out), { recursive: true })
+  fs.writeFileSync(out, JSON.stringify(pack))
+  const kb = fs.statSync(out).size / 1024
+
+  const countKids = (kids) => list(kids).reduce((n, k) => n + 1 + countKids(k.kids), 0)
+  const stats = {
+    factions: pack.factions.filter((f) => !f.library).length,
+    libraries: pack.factions.filter((f) => f.library).length,
+    roots: pack.factions.reduce((n, f) => n + f.roots.length, 0),
+    nodes: Object.keys(pack.nodes).length,
+    inline: Object.values(pack.nodes).reduce((n, x) => n + countKids(x.kids), 0),
+    profiles: Object.keys(pack.profiles).length,
+    rules: Object.keys(pack.rules).length,
+    categories: pack.categories.length,
+    forces: pack.forceTemplates.length,
+    costTypes: pack.costTypes.length,
+  }
+  summaries.push({ system, pack, stats, kb, out })
+
+  const lines = [
+    `# Raport importu — ${pack.name}`,
+    '',
+    `\`npm run import-data ${system.id}\` · źródło: [${system.repo}](${pack.source.repo}) · ${pack.version}`,
+    '',
+    '## Wynik',
+    '',
+    `| | |`,
+    `|---|---|`,
+    `| Frakcje | **${stats.factions}**${stats.libraries ? ` (+${stats.libraries} bibliotek współdzielonych)` : ''} |`,
+    `| Pozycje wybieralne | **${stats.roots}** |`,
+    `| Węzły współdzielone | **${stats.nodes}** |`,
+    `| Węzły inline | **${stats.inline}** |`,
+    `| Profile | **${stats.profiles}** |`,
+    `| Zasady | **${stats.rules}** |`,
+    `| Kategorie | **${stats.categories}** |`,
+    `| Szablony sił | **${stats.forces}** |`,
+    `| Typy kosztów | **${stats.costTypes}** |`,
+    `| Rozmiar packa | **${kb < 1024 ? `${kb.toFixed(0)} KB` : `${(kb / 1024).toFixed(1)} MB`}** |`,
+    '',
+    '## DO UZUPEŁNIENIA',
+    '',
+    report.unmapped.size
+      ? [...report.unmapped.entries()].sort((a, b) => b[1] - a[1]).map(([m, n]) => `- ${m} — ${n}×`).join('\n')
+      : '_Nic — wszystkie napotkane konstrukcje zostały zmapowane._',
+    '',
+    '## Ostrzeżenia',
+    '',
+    report.warnings.size
+      ? [...report.warnings.entries()].sort((a, b) => b[1] - a[1]).map(([m, n]) => `- ${m} — ${n}×`).join('\n')
+      : '_Brak._',
+    '',
+    '## Uwagi',
+    '',
+    report.notes.length ? report.notes.map((n) => `- ${n}`).join('\n') : '_Brak._',
+    '',
+  ]
+  fs.writeFileSync(path.join('data', `IMPORT-REPORT-${system.id}.md`), lines.join('\n'))
+
   console.log(
-    `${faction.name.padEnd(26)} fighters=${String(faction.fighters.length).padStart(2)}  rules=${faction.bandRules.length}`,
+    `${system.id.padEnd(4)} ${String(pack.name).padEnd(28)} frakcje=${String(stats.factions).padStart(2)} ` +
+      `korzenie=${String(stats.roots).padStart(4)} węzły=${String(stats.nodes).padStart(5)} ` +
+      `profile=${String(stats.profiles).padStart(5)} ${(kb / 1024).toFixed(1)} MB`,
+  )
+  console.log(
+    `     niezmapowane=${report.unmapped.size} ostrzeżenia=${report.warnings.size} -> ${out}, data/IMPORT-REPORT-${system.id}.md`,
   )
 }
-
-fs.mkdirSync(path.dirname(OUT), { recursive: true })
-fs.writeFileSync(OUT, JSON.stringify(pack))
-const kb = (fs.statSync(OUT).size / 1024).toFixed(0)
-
-const countNodes = (nodes) => nodes.reduce((n, x) => n + 1 + countNodes(x.children || []), 0)
-const stats = {
-  factions: pack.factions.length,
-  fighters: pack.factions.reduce((n, f) => n + f.fighters.length, 0),
-  nodes: pack.factions.reduce((n, f) => n + f.fighters.reduce((m, x) => m + countNodes(x.tree), 0), 0),
-  profiles: Object.keys(pack.profiles).length,
-  rules: Object.keys(pack.rules).length,
-}
-
-const lines = [
-  '# Raport importu danych BSData',
-  '',
-  `Wygenerowany przez \`npm run import-data\`. Źródło: [BSData/wh40k-shadow-war-armageddon](${pack.source.repo}), revision ${pack.version}.`,
-  '',
-  '## Wynik',
-  '',
-  `- Frakcje: **${stats.factions}**`,
-  `- Typy wojowników: **${stats.fighters}**`,
-  `- Węzły drzewa ekwipunku: **${stats.nodes}**`,
-  `- Profile: **${stats.profiles}**`,
-  `- Zasady: **${stats.rules}**`,
-  `- Rozmiar data packa: **${kb} KB**`,
-  '',
-  '## DO UZUPEŁNIENIA',
-  '',
-  report.unmapped.length
-    ? report.unmapped.map((u) => `- ${u}`).join('\n')
-    : '_Nic — wszystkie napotkane konstrukcje zostały zmapowane._',
-  '',
-  '## Ostrzeżenia',
-  '',
-  report.warnings.length ? report.warnings.map((u) => `- ${u}`).join('\n') : '_Brak._',
-  '',
-  '## Pominięte korzenie bez kategorii',
-  '',
-  report.notes.length ? report.notes.map((u) => `- ${u}`).join('\n') : '_Brak._',
-  '',
-]
-fs.writeFileSync(REPORT, lines.join('\n'))
-
-console.log(`\n-> ${OUT} (${kb} KB)`)
-console.log(`-> ${REPORT}`)
-console.log(`   ${stats.fighters} fighters, ${stats.nodes} loadout nodes, ${stats.profiles} profiles`)
-console.log(`   ${report.unmapped.length} unmapped constructs, ${report.warnings.length} warnings`)

@@ -1,23 +1,31 @@
-import { autoFill, toMap, toSels } from './engine'
-import { faction, fighterIndex, fighterType } from './pack'
-import type { Fighter, GameRecord, Pack, Roster, Sel } from './types'
+import { Ctx, isGranted, selList, selMap } from './engine'
+import { childId, rootOf } from './tree'
+import type { Node } from './tree'
+import { findTemplate } from './engine'
+import type { Force, GameRecord, Id, Pack, Roster, Sel, Unit, UnitStatus } from './types'
 
 let counter = 0
 export const uid = (prefix: string) =>
   `${prefix}${Date.now().toString(36)}${(counter++).toString(36)}${Math.random().toString(36).slice(2, 6)}`
 
-export function newRoster(pack: Pack, factionId: string, name?: string): Roster {
+/** The template a new roster starts with: the system's first, or a bare container. */
+export function defaultTemplate(pack: Pack): { id: Id; name: string } {
+  const first = pack.forceTemplates[0]
+  return first ? { id: first.id, name: first.name } : { id: 'default', name: pack.vocabulary.band }
+}
+
+export function newRoster(pack: Pack, factionId: Id, name?: string): Roster {
   const now = new Date().toISOString()
-  const fac = faction(pack, factionId)
+  const faction = pack.factions.find((f) => f.id === factionId)
+  const template = defaultTemplate(pack)
   return {
-    schema: 'bandbuilder/roster@1',
+    schema: 'bandbuilder/roster@2',
     id: uid('r'),
-    name: name || `Nowa drużyna (${fac?.name ?? factionId})`,
+    name: name || `Nowa lista (${faction?.name ?? factionId})`,
     pack: { id: pack.id, version: pack.version },
     factionId,
-    bandOptions: [],
     budget: pack.budget.default,
-    fighters: [],
+    forces: [{ uid: uid('force'), templateId: template.id, name: template.name, units: [], forces: [] }],
     campaign: { enabled: false, caches: 0, games: [] },
     meta: { created: now, modified: now },
   }
@@ -29,69 +37,139 @@ export type Action =
   | { t: 'band/toggleCampaign'; on: boolean }
   | { t: 'band/setCaches'; value: number }
   | { t: 'band/logGame'; game: GameRecord }
-  | { t: 'band/removeGame'; id: string }
-  | { t: 'fighter/add'; typeId: string }
-  | { t: 'fighter/remove'; uid: string }
-  | { t: 'fighter/rename'; uid: string; name: string }
-  | { t: 'fighter/duplicate'; uid: string }
-  | { t: 'fighter/move'; uid: string; dir: -1 | 1 }
-  | { t: 'fighter/notes'; uid: string; notes: string }
-  | { t: 'fighter/status'; uid: string; status: Fighter['campaign']['status'] }
-  | { t: 'fighter/xp'; uid: string; delta: number }
-  | { t: 'fighter/injury/add'; uid: string; text: string }
-  | { t: 'fighter/injury/remove'; uid: string; id: string }
-  | { t: 'gear/set'; uid: string; nodeId: string; qty: number }
-  | { t: 'gear/clearGroup'; uid: string; groupId: string }
-  | { t: 'advance/set'; uid: string; nodeId: string; qty: number }
+  | { t: 'band/removeGame'; id: Id }
+  | { t: 'force/add'; parentUid: Id | null; templateId: Id }
+  | { t: 'force/remove'; uid: Id }
+  | { t: 'force/rename'; uid: Id; name: string }
+  | { t: 'unit/add'; forceUid: Id; factionId: Id; rootId: Id }
+  | { t: 'unit/remove'; uid: Id }
+  | { t: 'unit/rename'; uid: Id; name: string }
+  | { t: 'unit/duplicate'; uid: Id }
+  | { t: 'unit/move'; uid: Id; dir: -1 | 1 }
+  | { t: 'unit/notes'; uid: Id; notes: string }
+  | { t: 'unit/status'; uid: Id; status: UnitStatus }
+  | { t: 'unit/xp'; uid: Id; delta: number }
+  | { t: 'unit/injury/add'; uid: Id; text: string }
+  | { t: 'unit/injury/remove'; uid: Id; id: Id }
+  | { t: 'gear/set'; uid: Id; path: string; qty: number }
+  | { t: 'gear/clearGroup'; uid: Id; path: string }
+  | { t: 'advance/set'; uid: Id; path: string; qty: number }
 
-/**
- * Names default to the type with a running number, so a band never has two nameless models.
- * Counted per type id, not per name prefix: "Scout Sergeant" and "Scout Gunner" must not make
- * the first plain Scout come out as "Scout 3".
- */
-function defaultName(roster: Roster, typeId: string, typeName: string): string {
-  let n = 0
-  for (const f of roster.fighters) if (f.typeId === typeId) n++
-  return n === 0 ? typeName : `${typeName} ${n + 1}`
+// --- helpers -------------------------------------------------------------------------------------
+
+const mapForces = (forces: Force[], fn: (f: Force) => Force): Force[] =>
+  forces.map((f) => fn({ ...f, forces: mapForces(f.forces, fn) }))
+
+const allForces = (roster: Roster): Force[] => {
+  const out: Force[] = []
+  const walk = (f: Force) => {
+    out.push(f)
+    f.forces.forEach(walk)
+  }
+  roster.forces.forEach(walk)
+  return out
+}
+
+export const findUnit = (roster: Roster, uid: Id): Unit | undefined =>
+  allForces(roster).flatMap((f) => f.units).find((u) => u.uid === uid)
+
+export const forceOfUnit = (roster: Roster, uid: Id): Force | undefined =>
+  allForces(roster).find((f) => f.units.some((u) => u.uid === uid))
+
+const mapUnit = (roster: Roster, uid: Id, fn: (u: Unit) => Unit): Roster => ({
+  ...roster,
+  forces: mapForces(roster.forces, (f) => ({ ...f, units: f.units.map((u) => (u.uid === uid ? fn(u) : u)) })),
+})
+
+function setQty(sels: Sel[], path: string, qty: number): Sel[] {
+  const m = selMap(sels)
+  if (qty <= 0) m.delete(path)
+  else m.set(path, qty)
+  return selList(m)
 }
 
 /**
- * Drop selections that are no longer reachable. Removing a boltgun must also remove its scope,
- * otherwise the roster keeps paying for an upgrade to a weapon the fighter no longer carries.
+ * Resolve a unit against the pack so gear can be pruned and topped up. Building a one-unit context
+ * is cheap and keeps this module free of its own tree-walking logic.
  */
-function prune(pack: Pack, roster: Roster, fighter: Fighter): Fighter {
-  const type = fighterType(pack, roster.factionId, fighter.typeId)
-  if (!type) return fighter
-  const idx = fighterIndex(type)
-  const keep = (sels: Sel[]): Sel[] => {
-    let sel = toMap(sels)
-    for (let pass = 0; pass < 8; pass++) {
-      let changed = false
-      for (const id of [...sel.keys()]) {
-        const ancestors = idx.ancestorsOf.get(id) ?? []
-        const orphan = ancestors.some((a) => idx.byId.get(a)?.k === 'i' && !sel.has(a))
-        if (orphan) {
-          sel.delete(id)
+function viewFor(pack: Pack, roster: Roster, unit: Unit) {
+  const probe: Roster = {
+    ...roster,
+    forces: [{ uid: 'probe', templateId: roster.forces[0]?.templateId ?? 'default', name: '', units: [unit], forces: [] }],
+  }
+  const ctx = new Ctx(pack, probe)
+  return { ctx, view: ctx.units[0] }
+}
+
+/**
+ * Drop selections whose parent entry is gone, then add back anything the data makes mandatory.
+ * Both iterate to a fixed point: removing a weapon orphans its scope, and granting an upgrade can
+ * expose a further mandatory upgrade underneath it.
+ */
+function reconcile(pack: Pack, roster: Roster, unit: Unit): Unit {
+  let current = unit
+  for (let pass = 0; pass < 8; pass++) {
+    const { ctx, view } = viewFor(pack, roster, current)
+    if (!view) return current
+
+    const gear = selMap(current.gear)
+    let changed = false
+
+    for (const path of [...gear.keys()]) {
+      const parts = path.split('/')
+      // Every entry above this one must still be selected; groups are transparent, and the unit
+      // root is always present without appearing in the selection map.
+      for (let i = parts.length - 1; i > 1; i--) {
+        const parentPath = parts.slice(0, i).join('/')
+        if (parentPath === view.root.path) continue
+        const parentNode = view.nodes.get(parentPath)
+        if (parentNode && parentNode.k === 'e' && !gear.has(parentPath)) {
+          gear.delete(path)
           changed = true
+          break
         }
       }
-      if (!changed) break
     }
-    return toSels(sel)
+
+    const grantable: Node[] = []
+    const collect = (node: Node) => {
+      for (const child of view.tree.children(node)) {
+        const live = child.ancestorNodes.every(
+          (a) => a.path === view.root.path || a.k === 'g' || gear.has(a.path),
+        )
+        if (!live) continue
+        if (child.k === 'e') {
+          const min = ctx
+            .effective(view, child)
+            .cons.find((c) => c.type === 'min' && c.field === 'selections')?.value
+          if (min && min >= 1 && (gear.get(child.path) ?? 0) < min) grantable.push(child)
+        }
+        if (child.k === 'g' || gear.has(child.path)) collect(child)
+      }
+    }
+    collect(view.root)
+
+    for (const node of grantable) {
+      const min = ctx.effective(view, node).cons.find((c) => c.type === 'min')?.value ?? 1
+      gear.set(node.path, min)
+      changed = true
+    }
+
+    if (!changed) return current
+    current = { ...current, gear: selList(gear) }
   }
-  return { ...fighter, gear: keep(fighter.gear), campaign: { ...fighter.campaign, advances: keep(fighter.campaign.advances) } }
+  return current
 }
 
-function mapFighter(roster: Roster, uid: string, fn: (f: Fighter) => Fighter): Roster {
-  return { ...roster, fighters: roster.fighters.map((f) => (f.uid === uid ? fn(f) : f)) }
+/** Names default to the entry with a running number, counted per entry so they never collide. */
+function defaultName(roster: Roster, rootId: Id, name: string): string {
+  const n = allForces(roster)
+    .flatMap((f) => f.units)
+    .filter((u) => u.rootId === rootId).length
+  return n === 0 ? name : `${name} ${n + 1}`
 }
 
-function setQty(sels: Sel[], nodeId: string, qty: number): Sel[] {
-  const m = toMap(sels)
-  if (qty <= 0) m.delete(nodeId)
-  else m.set(nodeId, qty)
-  return toSels(m)
-}
+// --- reducer -------------------------------------------------------------------------------------
 
 export function applyAction(pack: Pack, roster: Roster, action: Action): Roster {
   const touch = (r: Roster): Roster => ({ ...r, meta: { ...r.meta, modified: new Date().toISOString() } })
@@ -126,103 +204,146 @@ export function applyAction(pack: Pack, roster: Roster, action: Action): Roster 
       })
     }
 
-    case 'fighter/add': {
-      const type = fighterType(pack, roster.factionId, action.typeId)
-      if (!type) return roster
-      const fighter: Fighter = {
-        uid: uid('f'),
-        typeId: type.id,
-        name: defaultName(roster, type.id, type.name),
-        gear: autoFill(type, []),
+    case 'force/add': {
+      const template = findTemplate(pack, action.templateId)
+      if (!template) return roster
+      const force: Force = { uid: uid('force'), templateId: template.id, name: template.name, units: [], forces: [] }
+      if (!action.parentUid) return touch({ ...roster, forces: [...roster.forces, force] })
+      return touch({
+        ...roster,
+        forces: mapForces(roster.forces, (f) =>
+          f.uid === action.parentUid ? { ...f, forces: [...f.forces, force] } : f,
+        ),
+      })
+    }
+    case 'force/remove': {
+      const strip = (list: Force[]): Force[] =>
+        list.filter((f) => f.uid !== action.uid).map((f) => ({ ...f, forces: strip(f.forces) }))
+      const forces = strip(roster.forces)
+      return touch({ ...roster, forces: forces.length ? forces : roster.forces })
+    }
+    case 'force/rename':
+      return touch({
+        ...roster,
+        forces: mapForces(roster.forces, (f) => (f.uid === action.uid ? { ...f, name: action.name } : f)),
+      })
+
+    case 'unit/add': {
+      const child = rootOf(pack, action.factionId, action.rootId)
+      if (!child) return roster
+      const ctx = new Ctx(pack, roster)
+      const node = ctx.treeFor(action.factionId).root(child)
+      if (!node) return roster
+      const bare: Unit = {
+        uid: uid('u'),
+        rootId: childId(child),
+        factionId: action.factionId,
+        name: defaultName(roster, childId(child), node.name),
+        gear: [],
         campaign: { xp: 0, advances: [], injuries: [], status: 'active' },
         notes: '',
       }
-      return touch({ ...roster, fighters: [...roster.fighters, fighter] })
+      const unit = reconcile(pack, roster, bare)
+      return touch({
+        ...roster,
+        forces: mapForces(roster.forces, (f) =>
+          f.uid === action.forceUid ? { ...f, units: [...f.units, unit] } : f,
+        ),
+      })
     }
-    case 'fighter/remove':
-      return touch({ ...roster, fighters: roster.fighters.filter((f) => f.uid !== action.uid) })
-    case 'fighter/rename':
-      return touch(mapFighter(roster, action.uid, (f) => ({ ...f, name: action.name })))
-    case 'fighter/notes':
-      return touch(mapFighter(roster, action.uid, (f) => ({ ...f, notes: action.notes })))
-    case 'fighter/status':
+    case 'unit/remove':
+      return touch({
+        ...roster,
+        forces: mapForces(roster.forces, (f) => ({ ...f, units: f.units.filter((u) => u.uid !== action.uid) })),
+      })
+    case 'unit/rename':
+      return touch(mapUnit(roster, action.uid, (u) => ({ ...u, name: action.name })))
+    case 'unit/notes':
+      return touch(mapUnit(roster, action.uid, (u) => ({ ...u, notes: action.notes })))
+    case 'unit/status':
+      return touch(mapUnit(roster, action.uid, (u) => ({ ...u, campaign: { ...u.campaign, status: action.status } })))
+    case 'unit/xp':
       return touch(
-        mapFighter(roster, action.uid, (f) => ({ ...f, campaign: { ...f.campaign, status: action.status } })),
-      )
-    case 'fighter/xp':
-      return touch(
-        mapFighter(roster, action.uid, (f) => ({
-          ...f,
-          campaign: { ...f.campaign, xp: Math.max(0, f.campaign.xp + action.delta) },
+        mapUnit(roster, action.uid, (u) => ({
+          ...u,
+          campaign: { ...u.campaign, xp: Math.max(0, u.campaign.xp + action.delta) },
         })),
       )
-    case 'fighter/injury/add':
+    case 'unit/injury/add':
       return touch(
-        mapFighter(roster, action.uid, (f) => ({
-          ...f,
-          campaign: { ...f.campaign, injuries: [...f.campaign.injuries, { id: uid('i'), text: action.text }] },
+        mapUnit(roster, action.uid, (u) => ({
+          ...u,
+          campaign: { ...u.campaign, injuries: [...u.campaign.injuries, { id: uid('i'), text: action.text }] },
         })),
       )
-    case 'fighter/injury/remove':
+    case 'unit/injury/remove':
       return touch(
-        mapFighter(roster, action.uid, (f) => ({
-          ...f,
-          campaign: { ...f.campaign, injuries: f.campaign.injuries.filter((i) => i.id !== action.id) },
+        mapUnit(roster, action.uid, (u) => ({
+          ...u,
+          campaign: { ...u.campaign, injuries: u.campaign.injuries.filter((i) => i.id !== action.id) },
         })),
       )
-    case 'fighter/duplicate': {
-      const src = roster.fighters.find((f) => f.uid === action.uid)
-      if (!src) return roster
-      const type = fighterType(pack, roster.factionId, src.typeId)
-      const copy: Fighter = {
-        ...structuredClone(src),
-        uid: uid('f'),
-        name: defaultName(roster, src.typeId, type?.name ?? src.name),
+    case 'unit/duplicate': {
+      const source = findUnit(roster, action.uid)
+      if (!source) return roster
+      const copy: Unit = {
+        ...structuredClone(source),
+        uid: uid('u'),
+        name: defaultName(roster, source.rootId, stripNumber(source.name)),
       }
-      const at = roster.fighters.indexOf(src) + 1
-      const fighters = [...roster.fighters]
-      fighters.splice(at, 0, copy)
-      return touch({ ...roster, fighters })
+      return touch({
+        ...roster,
+        forces: mapForces(roster.forces, (f) => {
+          const at = f.units.findIndex((u) => u.uid === action.uid)
+          if (at < 0) return f
+          const units = [...f.units]
+          units.splice(at + 1, 0, copy)
+          return { ...f, units }
+        }),
+      })
     }
-    case 'fighter/move': {
-      const i = roster.fighters.findIndex((f) => f.uid === action.uid)
-      const j = i + action.dir
-      if (i < 0 || j < 0 || j >= roster.fighters.length) return roster
-      const fighters = [...roster.fighters]
-      ;[fighters[i], fighters[j]] = [fighters[j], fighters[i]]
-      return touch({ ...roster, fighters })
-    }
+    case 'unit/move':
+      return touch({
+        ...roster,
+        forces: mapForces(roster.forces, (f) => {
+          const i = f.units.findIndex((u) => u.uid === action.uid)
+          const j = i + action.dir
+          if (i < 0 || j < 0 || j >= f.units.length) return f
+          const units = [...f.units]
+          ;[units[i], units[j]] = [units[j], units[i]]
+          return { ...f, units }
+        }),
+      })
 
     case 'gear/set':
       return touch(
-        mapFighter(roster, action.uid, (f) => {
-          const type = fighterType(pack, roster.factionId, f.typeId)
-          if (!type) return f
-          const withQty = { ...f, gear: setQty(f.gear, action.nodeId, action.qty) }
-          const pruned = prune(pack, roster, withQty)
-          return { ...pruned, gear: autoFill(type, pruned.gear) }
-        }),
+        mapUnit(roster, action.uid, (u) => reconcile(pack, roster, { ...u, gear: setQty(u.gear, action.path, action.qty) })),
       )
     case 'gear/clearGroup':
       return touch(
-        mapFighter(roster, action.uid, (f) => {
-          const type = fighterType(pack, roster.factionId, f.typeId)
-          if (!type) return f
-          const idx = fighterIndex(type)
-          const group = idx.byId.get(action.groupId)
-          if (group?.k !== 'g') return f
-          const m = toMap(f.gear)
-          for (const c of group.children) if (c.k === 'i' && !(c.min && c.min >= 1)) m.delete(c.id)
-          const pruned = prune(pack, roster, { ...f, gear: toSels(m) })
-          return { ...pruned, gear: autoFill(type, pruned.gear) }
+        mapUnit(roster, action.uid, (u) => {
+          const { ctx, view } = viewFor(pack, roster, u)
+          if (!view) return u
+          const group = view.nodes.get(action.path) ?? findByPath(view, action.path)
+          if (!group) return u
+          const gear = selMap(u.gear)
+          for (const child of view.tree.children(group))
+            if (child.k === 'e' && !isGranted(ctx, view, child)) gear.delete(child.path)
+          return reconcile(pack, roster, { ...u, gear: selList(gear) })
         }),
       )
     case 'advance/set':
       return touch(
-        mapFighter(roster, action.uid, (f) => ({
-          ...f,
-          campaign: { ...f.campaign, advances: setQty(f.campaign.advances, action.nodeId, action.qty) },
+        mapUnit(roster, action.uid, (u) => ({
+          ...u,
+          campaign: { ...u.campaign, advances: setQty(u.campaign.advances, action.path, action.qty) },
         })),
       )
   }
 }
+
+function findByPath(view: { root: Node; tree: { find: (r: Node, p: string) => Node | null } }, path: string) {
+  return view.tree.find(view.root, path)
+}
+
+const stripNumber = (name: string) => name.replace(/\s\d+$/, '')

@@ -1,291 +1,313 @@
 import { describe, expect, it } from 'vitest'
-import packData from '../data/swa.json'
-import { computeCosts, effectiveStatline, gearLines, groupCount, toMap, validate } from './engine'
-import { faction, fighterIndex, fighterType } from './pack'
+import swaRaw from '../data/swa.json'
+import hh3Raw from '../data/hh3.json'
+import { Ctx, blockedReason, computeCosts, gearLines, groupCount, isGranted, unitCost, validate } from './engine'
 import { applyAction, newRoster } from './roster'
-import type { GroupNode, ItemNode, Pack, Roster } from './types'
+import { childId } from './tree'
+import type { Node } from './tree'
+import type { Pack, Roster } from './types'
 
-const pack = packData as unknown as Pack
-const SCOUTS = 'space-marine-scouts'
+const swa = swaRaw as unknown as Pack
+const hh3 = hh3Raw as unknown as Pack
 
-const build = (factionId = SCOUTS) => newRoster(pack, factionId)
-const act = (r: Roster, ...actions: Parameters<typeof applyAction>[2][]) =>
+const act = (pack: Pack, r: Roster, ...actions: Parameters<typeof applyAction>[2][]) =>
   actions.reduce((acc, a) => applyAction(pack, acc, a), r)
 
-const typeByName = (factionId: string, name: string) => {
-  const t = faction(pack, factionId)!.fighters.find((f) => f.name === name)
-  if (!t) throw new Error(`no fighter type "${name}" in ${factionId}`)
-  return t
+const faction = (pack: Pack, match: RegExp) => {
+  const f = pack.factions.find((x) => match.test(x.name))
+  if (!f) throw new Error(`no faction matching ${match}`)
+  return f
 }
 
-const findNode = (factionId: string, typeName: string, nodeName: string) => {
-  const type = typeByName(factionId, typeName)
-  for (const [, node] of fighterIndex(type).byId) if (node.name === nodeName) return node
-  throw new Error(`no node "${nodeName}" on ${typeName}`)
+/** Find a root entry by name, returning the id a roster stores. */
+function rootByName(pack: Pack, factionName: RegExp, name: string) {
+  const f = faction(pack, factionName)
+  const ctx = new Ctx(pack, newRoster(pack, f.id))
+  const tree = ctx.treeFor(f.id)
+  for (const child of f.roots) {
+    const node = tree.root(child)
+    if (node?.name === name) return { factionId: f.id, rootId: childId(child) }
+  }
+  throw new Error(`no root "${name}" in ${f.name}`)
 }
 
-describe('data pack', () => {
-  it('has every faction with band rules and fighters', () => {
-    expect(pack.factions.length).toBeGreaterThanOrEqual(15)
-    for (const f of pack.factions) {
-      expect(f.fighters.length, f.name).toBeGreaterThan(0)
-      expect(f.bandRules.length, f.name).toBeGreaterThan(0)
-      expect(f.fighters.some((x) => x.categoryId === 'leader'), `${f.name} has a leader`).toBe(true)
+const firstForce = (r: Roster) => r.forces[0].uid
+
+function addUnit(pack: Pack, r: Roster, factionName: RegExp, name: string) {
+  const { factionId, rootId } = rootByName(pack, factionName, name)
+  return act(pack, r, { t: 'unit/add', forceUid: firstForce(r), factionId, rootId })
+}
+
+/** Locate a node inside the newest unit by name, expanding the tree as needed. */
+function nodeByName(pack: Pack, r: Roster, unitUid: string, name: string | RegExp): Node {
+  const ctx = new Ctx(pack, r)
+  const view = ctx.unitOf(unitUid)
+  if (!view) throw new Error('unit not in roster')
+  const match = (n: string) => (typeof name === 'string' ? n === name : name.test(n))
+  const queue: Node[] = [view.root]
+  for (let i = 0; i < queue.length && i < 20000; i++) {
+    const node = queue[i]
+    if (node !== view.root && match(ctx.effective(view, node).name)) return node
+    for (const c of view.tree.children(node)) queue.push(c)
+  }
+  throw new Error(`no node "${name}"`)
+}
+
+const lastUnit = (r: Roster) => r.forces[0].units[r.forces[0].units.length - 1]
+const ctxOf = (pack: Pack, r: Roster) => new Ctx(pack, r)
+const issuesOf = (pack: Pack, r: Roster) => {
+  const ctx = ctxOf(pack, r)
+  return validate(ctx, computeCosts(ctx)).map((i) => i.message)
+}
+
+// -------------------------------------------------------------------------------------------------
+
+describe('packs load', () => {
+  it.each([
+    ['swa', swa, 15],
+    ['hh3', hh3, 30],
+  ])('%s has factions, nodes and cost types', (_id, pack, minFactions) => {
+    expect(pack.schema).toBe('bandbuilder/datapack@2')
+    expect(pack.factions.filter((f) => !f.library).length).toBeGreaterThanOrEqual(minFactions)
+    expect(Object.keys(pack.nodes).length).toBeGreaterThan(100)
+    expect(pack.costTypes.length).toBeGreaterThan(0)
+    expect(pack.primaryCost).toBeTruthy()
+  })
+
+  it('marks a statline type only where the system has one universal model line', () => {
+    expect(swa.statlineType).toBeTruthy()
+    expect(hh3.statlineType).toBeUndefined()
+  })
+
+  it('gives Horus Heresy its force organisation templates', () => {
+    const crusade = hh3.forceTemplates.find((t) => /Crusade Force Organization/i.test(t.name))
+    expect(crusade).toBeTruthy()
+    expect(crusade!.children!.length).toBeGreaterThan(20)
+    expect(crusade!.children!.some((c) => /Crusade Primary Detachment/.test(c.name))).toBe(true)
+  })
+})
+
+describe('Shadow War: Armageddon', () => {
+  const SCOUTS = /Space Marine Scouts/
+
+  it('costs a fighter with its granted gear', () => {
+    let r = newRoster(swa, faction(swa, SCOUTS).id)
+    r = addUnit(swa, r, SCOUTS, 'Scout Sergeant')
+    const ctx = ctxOf(swa, r)
+    // Scout armour and a combat blade come with the model, at no extra cost.
+    expect(lastUnit(r).gear.length).toBeGreaterThan(0)
+    expect(computeCosts(ctx).total).toBe(200)
+  })
+
+  it('adds bought gear and drops its sub-options when the weapon goes', () => {
+    let r = newRoster(swa, faction(swa, SCOUTS).id)
+    r = addUnit(swa, r, SCOUTS, 'Scout Sergeant')
+    const uid = lastUnit(r).uid
+
+    const boltgun = nodeByName(swa, r, uid, 'Boltgun')
+    r = act(swa, r, { t: 'gear/set', uid, path: boltgun.path, qty: 1 })
+    expect(computeCosts(ctxOf(swa, r)).total).toBe(235)
+
+    const sight = nodeByName(swa, r, uid, 'Telescopic sight')
+    r = act(swa, r, { t: 'gear/set', uid, path: sight.path, qty: 1 })
+    expect(computeCosts(ctxOf(swa, r)).total).toBe(255)
+
+    r = act(swa, r, { t: 'gear/set', uid, path: boltgun.path, qty: 0 })
+    expect(r.forces[0].units[0].gear.some((s) => s.path === sight.path)).toBe(false)
+    expect(computeCosts(ctxOf(swa, r)).total).toBe(200)
+  })
+
+  it('names duplicates apart and copies their gear', () => {
+    let r = newRoster(swa, faction(swa, SCOUTS).id)
+    r = addUnit(swa, r, SCOUTS, 'Scout')
+    r = addUnit(swa, r, SCOUTS, 'Scout')
+    expect(r.forces[0].units.map((u) => u.name)).toEqual(['Scout', 'Scout 2'])
+
+    const uid = r.forces[0].units[0].uid
+    r = act(swa, r, { t: 'unit/duplicate', uid })
+    expect(r.forces[0].units).toHaveLength(3)
+    expect(r.forces[0].units[1].gear).toEqual(r.forces[0].units[0].gear)
+  })
+
+  it('reports going over budget', () => {
+    let r = newRoster(swa, faction(swa, SCOUTS).id)
+    r = addUnit(swa, r, SCOUTS, 'Scout Sergeant')
+    r = act(swa, r, { t: 'band/setBudget', value: 10 })
+    expect(issuesOf(swa, r).join(' ')).toMatch(/budżet/i)
+    r = act(swa, r, { t: 'band/setBudget', value: 1000 })
+    expect(issuesOf(swa, r).join(' ')).not.toMatch(/budżet/i)
+  })
+
+  it('lists carried gear for a sheet', () => {
+    let r = newRoster(swa, faction(swa, SCOUTS).id)
+    r = addUnit(swa, r, SCOUTS, 'Scout Sergeant')
+    const uid = lastUnit(r).uid
+    const sword = nodeByName(swa, r, uid, 'Power sword')
+    r = act(swa, r, { t: 'gear/set', uid, path: sword.path, qty: 1 })
+    const ctx = ctxOf(swa, r)
+    expect(gearLines(ctx, ctx.unitOf(uid)!).map((l) => l.name)).toContain('Power sword')
+  })
+})
+
+describe('Horus Heresy: units of many models', () => {
+  const LEGION = /Legiones Astartes/
+
+  const assaultSquad = () => {
+    const f = faction(hh3, LEGION)
+    let r = newRoster(hh3, f.id)
+    r = act(hh3, r, { t: 'band/setBudget', value: 3000 })
+    r = addUnit(hh3, r, LEGION, 'Assault Squad')
+    return r
+  }
+
+  it('refuses to shrink a squad below its minimum size', () => {
+    let r = assaultSquad()
+    const uid = lastUnit(r).uid
+    const legionary = nodeByName(hh3, r, uid, 'Legionary')
+    // The data says nine or more; asking for five puts it straight back to nine.
+    r = act(hh3, r, { t: 'gear/set', uid, path: legionary.path, qty: 5 })
+    const ctx = ctxOf(hh3, r)
+    expect(ctx.unitOf(uid)!.selected.get(legionary.path)).toBe(9)
+  })
+
+  it('starts at its minimum legal size and costs unit plus per-model points', () => {
+    const r = assaultSquad()
+    const ctx = ctxOf(hh3, r)
+    const view = ctx.unitOf(lastUnit(r).uid)!
+    const legionary = nodeByName(hh3, r, view.unit.uid, 'Legionary')
+    // 9 Legionaries at 12, a Sergeant that is mandatory and free, and 32 on the unit itself.
+    expect(view.selected.get(legionary.path)).toBe(9)
+    expect(unitCost(ctx, view)).toBe(32 + 9 * 12)
+  })
+
+  it('scales the cost with the number of models', () => {
+    let r = assaultSquad()
+    const uid = lastUnit(r).uid
+    const legionary = nodeByName(hh3, r, uid, 'Legionary')
+    r = act(hh3, r, { t: 'gear/set', uid, path: legionary.path, qty: 19 })
+    expect(computeCosts(ctxOf(hh3, r)).total).toBe(32 + 19 * 12)
+  })
+
+  it('rejects a squad above its maximum size', () => {
+    let r = assaultSquad()
+    const uid = lastUnit(r).uid
+    const legionary = nodeByName(hh3, r, uid, 'Legionary')
+    r = act(hh3, r, { t: 'gear/set', uid, path: legionary.path, qty: 25 })
+    expect(issuesOf(hh3, r).join(' ')).toMatch(/najwyżej 19/)
+  })
+
+  it('keeps the mandatory Sergeant', () => {
+    const r = assaultSquad()
+    const ctx = ctxOf(hh3, r)
+    const view = ctx.unitOf(lastUnit(r).uid)!
+    const sergeant = nodeByName(hh3, r, view.unit.uid, 'Sergeant')
+    expect(view.selected.get(sergeant.path)).toBe(1)
+    expect(isGranted(ctx, view, sergeant)).toBe(true)
+  })
+})
+
+describe('Horus Heresy: limits that scale with unit size', () => {
+  const LEGION = /Legiones Astartes/
+
+  /**
+   * "1-5 may exchange their Chainsword for..." is a constraint of zero raised by a modifier that
+   * repeats once per five models in the unit. Getting this right is the whole reason the engine
+   * evaluates modifiers rather than reading constraints straight off the data.
+   *
+   * The count is of models, so the mandatory Sergeant counts too: a squad of nine Legionaries plus
+   * a Sergeant is ten models and gets two exchanges.
+   */
+  it('raises a per-five-models option limit as the squad grows', () => {
+    const f = faction(hh3, LEGION)
+    let r = act(hh3, newRoster(hh3, f.id), { t: 'band/setBudget', value: 3000 })
+    r = addUnit(hh3, r, LEGION, 'Assault Squad')
+    const uid = lastUnit(r).uid
+    const legionary = nodeByName(hh3, r, uid, 'Legionary')
+
+    const limitFor = (legionaries: number) => {
+      const next = act(hh3, r, { t: 'gear/set', uid, path: legionary.path, qty: legionaries })
+      const ctx = ctxOf(hh3, next)
+      const view = ctx.unitOf(uid)!
+      const group = nodeByName(hh3, next, uid, /^1-5 may exchange Chainsword/)
+      const max = ctx.effective(view, group).cons.find((c) => c.type === 'max' && c.field === 'selections')
+      return max?.value ?? null
     }
+
+    expect(limitFor(9)).toBe(2) // 10 models
+    expect(limitFor(14)).toBe(3) // 15 models
+    expect(limitFor(19)).toBe(4) // 20 models
   })
 
-  it('keeps the faction deviations from the rulebook', () => {
-    const maxOf = (id: string) => faction(pack, id)!.bandRules.find((r) => r.id === 'max-fighters')?.value
-    const specialistsOf = (id: string) => faction(pack, id)!.bandRules.find((r) => r.id === 'max-specialist')?.value
-    expect(maxOf('ork-boyz-kill-team')).toBe(20)
-    expect(maxOf(SCOUTS)).toBe(10)
-    expect(specialistsOf('astra-militarum-veteran-kill-team')).toBe(3)
-    expect(specialistsOf(SCOUTS)).toBe(2)
-  })
+  it('blocks an option once its scaled group limit is used up', () => {
+    const f = faction(hh3, LEGION)
+    let r = act(hh3, newRoster(hh3, f.id), { t: 'band/setBudget', value: 3000 })
+    r = addUnit(hh3, r, LEGION, 'Assault Squad')
+    const uid = lastUnit(r).uid
+    const legionary = nodeByName(hh3, r, uid, 'Legionary')
+    const group = nodeByName(hh3, r, uid, /^1-5 may exchange Chainsword/)
+    const ctx = ctxOf(hh3, r)
+    const view = ctx.unitOf(uid)!
+    const option = view.tree.children(group).find((c) => c.k === 'e')
+    expect(option, 'group has a pickable option').toBeTruthy()
 
-  it('gives every fighter type a value for every statistic', () => {
-    for (const f of pack.factions)
-      for (const t of f.fighters)
-        for (const s of pack.statline) expect(t.statline[s], `${f.name}/${t.name}/${s}`).toBeTruthy()
-  })
-
-  it('marks the known gaps in the community data instead of hiding them', () => {
-    // Blank characteristics come out as "?"; the count is asserted so a regression in the
-    // importer that starts dropping statistics wholesale cannot pass unnoticed.
-    const gaps = pack.factions.flatMap((f) =>
-      f.fighters.flatMap((t) => pack.statline.filter((s) => t.statline[s] === '?').map((s) => `${t.name}/${s}`)),
-    )
-    expect(gaps.length).toBeLessThanOrEqual(6)
-  })
-})
-
-describe('costs', () => {
-  it('sums the base cost of every fighter', () => {
-    const sergeant = typeByName(SCOUTS, 'Scout Sergeant')
-    const scout = typeByName(SCOUTS, 'Scout')
-    const r = act(build(), { t: 'fighter/add', typeId: sergeant.id }, { t: 'fighter/add', typeId: scout.id })
-    expect(computeCosts(pack, r).total).toBe(sergeant.cost + scout.cost)
-  })
-
-  it('adds gear and multiplies by quantity', () => {
-    const sergeant = typeByName(SCOUTS, 'Scout Sergeant')
-    const sword = findNode(SCOUTS, 'Scout Sergeant', 'Power sword') as ItemNode
-    let r = act(build(), { t: 'fighter/add', typeId: sergeant.id })
-    const uid = r.fighters[0].uid
-    r = act(r, { t: 'gear/set', uid, nodeId: sword.id, qty: 2 })
-    expect(computeCosts(pack, r).total).toBe(sergeant.cost + sword.cost * 2)
-  })
-
-  it('charges nothing for granted gear', () => {
-    const sergeant = typeByName(SCOUTS, 'Scout Sergeant')
-    const r = act(build(), { t: 'fighter/add', typeId: sergeant.id })
-    // The sergeant starts with armour and a blade already selected, at no extra cost.
-    expect(r.fighters[0].gear.length).toBeGreaterThan(0)
-    expect(computeCosts(pack, r).total).toBe(sergeant.cost)
-  })
-
-  it('reports cost per category', () => {
-    const leader = typeByName(SCOUTS, 'Scout Sergeant')
-    const trooper = typeByName(SCOUTS, 'Scout')
-    const r = act(build(), { t: 'fighter/add', typeId: leader.id }, { t: 'fighter/add', typeId: trooper.id })
-    const costs = computeCosts(pack, r)
-    expect(costs.byCategory.leader).toBe(leader.cost)
-    expect(costs.byCategory[trooper.categoryId]).toBe(trooper.cost)
+    expect(blockedReason(ctx, view, option!)).toBeNull()
+    r = act(hh3, r, { t: 'gear/set', uid, path: option!.path, qty: 1 })
+    const after = ctxOf(hh3, r)
+    const viewAfter = after.unitOf(uid)!
+    expect(groupCount(viewAfter, nodeByName(hh3, r, uid, /^1-5 may exchange Chainsword/))).toBe(1)
   })
 })
 
-describe('gear selection', () => {
-  it('drops sub-options when the weapon carrying them is removed', () => {
-    const sergeant = typeByName(SCOUTS, 'Scout Sergeant')
-    const boltgun = findNode(SCOUTS, 'Scout Sergeant', 'Boltgun') as ItemNode
-    const scope = boltgun.children
-      .flatMap((c) => (c.k === 'g' ? c.children : [c]))
-      .find((c) => c.k === 'i' && /telescopic|red-dot/i.test(c.name)) as ItemNode
-    let r = act(build(), { t: 'fighter/add', typeId: sergeant.id })
-    const uid = r.fighters[0].uid
-    r = act(r, { t: 'gear/set', uid, nodeId: boltgun.id, qty: 1 }, { t: 'gear/set', uid, nodeId: scope.id, qty: 1 })
-    expect(toMap(r.fighters[0].gear).has(scope.id)).toBe(true)
+describe('force organisation', () => {
+  it('adds a detachment under the chart and puts units in it', () => {
+    const f = faction(hh3, /Legiones Astartes/)
+    let r = act(hh3, newRoster(hh3, f.id), { t: 'band/setBudget', value: 3000 })
+    const chart = r.forces[0]
+    const primary = hh3.forceTemplates
+      .find((t) => /Crusade Force Organization/i.test(t.name))!
+      .children!.find((c) => /Crusade Primary Detachment/.test(c.name))!
 
-    r = act(r, { t: 'gear/set', uid, nodeId: boltgun.id, qty: 0 })
-    expect(toMap(r.fighters[0].gear).has(scope.id)).toBe(false)
-    expect(computeCosts(pack, r).total).toBe(sergeant.cost)
-  })
+    r = act(hh3, r, { t: 'force/add', parentUid: chart.uid, templateId: primary.id })
+    expect(r.forces[0].forces).toHaveLength(1)
 
-  it('counts group picks without counting nested groups', () => {
-    const group = findNode(SCOUTS, 'Scout Sergeant', 'Pistols') as GroupNode
-    const first = group.children.find((c) => c.k === 'i') as ItemNode
-    expect(groupCount(group, toMap([{ nodeId: first.id, qty: 2 }]))).toBe(2)
-  })
+    const detachment = r.forces[0].forces[0]
+    const { factionId, rootId } = rootByName(hh3, /Legiones Astartes/, 'Assault Squad')
+    r = act(hh3, r, { t: 'unit/add', forceUid: detachment.uid, factionId, rootId })
+    expect(r.forces[0].forces[0].units).toHaveLength(1)
 
-  it('lists carried gear for the sheet', () => {
-    const sergeant = typeByName(SCOUTS, 'Scout Sergeant')
-    const sword = findNode(SCOUTS, 'Scout Sergeant', 'Power sword') as ItemNode
-    let r = act(build(), { t: 'fighter/add', typeId: sergeant.id })
-    r = act(r, { t: 'gear/set', uid: r.fighters[0].uid, nodeId: sword.id, qty: 1 })
-    expect(gearLines(pack, r, r.fighters[0]).map((l) => l.name)).toContain('Power sword')
+    const ctx = ctxOf(hh3, r)
+    expect(ctx.units).toHaveLength(1)
+    expect(computeCosts(ctx).total).toBe(32 + 9 * 12)
   })
 })
 
-describe('validation', () => {
-  const ids = (r: Roster) => validate(pack, r, computeCosts(pack, r)).map((i) => i.ruleId)
-
-  it('demands a leader and three models', () => {
-    expect(ids(build())).toEqual(expect.arrayContaining(['min-fighters', 'min-leader']))
-  })
-
-  it('accepts a legal team', () => {
-    const leader = typeByName(SCOUTS, 'Scout Sergeant')
-    const scout = typeByName(SCOUTS, 'Scout')
-    const r = act(
-      build(),
-      { t: 'fighter/add', typeId: leader.id },
-      { t: 'fighter/add', typeId: scout.id },
-      { t: 'fighter/add', typeId: scout.id },
-    )
-    expect(ids(r)).toEqual([])
-  })
-
-  it('rejects a second leader', () => {
-    const leader = typeByName(SCOUTS, 'Scout Sergeant')
-    const r = act(build(), { t: 'fighter/add', typeId: leader.id }, { t: 'fighter/add', typeId: leader.id })
-    expect(ids(r)).toContain('max-leader')
-  })
-
-  it('flags going over budget', () => {
-    const leader = typeByName(SCOUTS, 'Scout Sergeant')
-    let r = act(build(), { t: 'band/setBudget', value: 10 }, { t: 'fighter/add', typeId: leader.id })
-    expect(ids(r)).toContain('budget')
-    r = act(r, { t: 'band/setBudget', value: 1000 })
-    expect(ids(r)).not.toContain('budget')
-  })
-
-  it('caps New Recruits at half the budget', () => {
-    const leader = typeByName(SCOUTS, 'Scout Sergeant')
-    const recruit = faction(pack, SCOUTS)!.fighters.find((f) => f.categoryId === 'recruit')!
-    const many = Math.ceil(501 / recruit.cost)
-    const r = act(
-      build(),
-      { t: 'fighter/add', typeId: leader.id },
-      ...Array.from({ length: many }, () => ({ t: 'fighter/add' as const, typeId: recruit.id })),
-    )
-    expect(computeCosts(pack, r).byCategory.recruit).toBeGreaterThan(500)
-    expect(ids(r)).toContain('max-cost-recruit')
-  })
-
-  it('lets each Special Operative raise the model limit', () => {
-    const leader = typeByName(SCOUTS, 'Scout Sergeant')
-    const scout = typeByName(SCOUTS, 'Scout')
-    const operative = faction(pack, SCOUTS)!.fighters.find((f) => f.categoryId === 'operative')!
-    // Ten ordinary models is the cap; the eleventh is legal only as an operative.
-    const ten = act(
-      build(),
-      { t: 'band/setBudget', value: 99_999 },
-      { t: 'fighter/add', typeId: leader.id },
-      ...Array.from({ length: 9 }, () => ({ t: 'fighter/add' as const, typeId: scout.id })),
-    )
-    expect(ids(ten)).not.toContain('max-fighters')
-    expect(ids(act(ten, { t: 'fighter/add', typeId: scout.id }))).toContain('max-fighters')
-    expect(ids(act(ten, { t: 'fighter/add', typeId: operative.id }))).not.toContain('max-fighters')
-  })
-
-  it('honours a per-type cap', () => {
-    const capped = faction(pack, SCOUTS)!.fighters.find((f) => f.max === 1)
-    if (!capped) return
-    const r = act(build(), { t: 'fighter/add', typeId: capped.id }, { t: 'fighter/add', typeId: capped.id })
-    expect(ids(r).some((id) => id.startsWith('type-max-'))).toBe(true)
-  })
-})
-
-describe('campaign', () => {
-  it('applies attribute advances to the statline', () => {
-    const sergeant = typeByName(SCOUTS, 'Scout Sergeant')
-    const advance = findNode(SCOUTS, 'Scout Sergeant', '+1 Ballistic Skill') as ItemNode
-    let r = act(build(), { t: 'fighter/add', typeId: sergeant.id })
-    const uid = r.fighters[0].uid
-    const before = effectiveStatline(pack, r, r.fighters[0]).BS.value
-    r = act(r, { t: 'advance/set', uid, nodeId: advance.id, qty: 1 })
-    const after = effectiveStatline(pack, r, r.fighters[0]).BS
-    expect(Number(after.value)).toBe(Number(before) + 1)
-    expect(after.changed).toBe(true)
-  })
-
-  it('keeps advances free', () => {
-    const sergeant = typeByName(SCOUTS, 'Scout Sergeant')
-    const advance = findNode(SCOUTS, 'Scout Sergeant', '+1 Toughness') as ItemNode
-    let r = act(build(), { t: 'fighter/add', typeId: sergeant.id })
-    r = act(r, { t: 'advance/set', uid: r.fighters[0].uid, nodeId: advance.id, qty: 1 })
-    expect(computeCosts(pack, r).total).toBe(sergeant.cost)
-  })
-
-  it('tracks caches from logged games', () => {
-    let r = build()
-    r = act(r, { t: 'band/logGame', game: { id: 'g1', date: '2026-09-04', result: 'win', caches: 3, note: '' } })
-    expect(r.campaign.caches).toBe(3)
-    r = act(r, { t: 'band/removeGame', id: 'g1' })
-    expect(r.campaign.caches).toBe(0)
-  })
-})
-
-describe('roster actions', () => {
-  it('names duplicates apart', () => {
-    const scout = typeByName(SCOUTS, 'Scout')
-    const r = act(build(), { t: 'fighter/add', typeId: scout.id }, { t: 'fighter/add', typeId: scout.id })
-    expect(r.fighters.map((f) => f.name)).toEqual(['Scout', 'Scout 2'])
-  })
-
-  it('numbers by type, not by name prefix', () => {
-    // "Scout Sergeant" and "Scout Gunner" must not push the first plain Scout to "Scout 3".
-    const r = act(
-      build(),
-      { t: 'fighter/add', typeId: typeByName(SCOUTS, 'Scout Sergeant').id },
-      { t: 'fighter/add', typeId: typeByName(SCOUTS, 'Scout Gunner').id },
-      { t: 'fighter/add', typeId: typeByName(SCOUTS, 'Scout').id },
-    )
-    expect(r.fighters[2].name).toBe('Scout')
-  })
-
-  it('copies gear when duplicating a fighter', () => {
-    const sergeant = typeByName(SCOUTS, 'Scout Sergeant')
-    const sword = findNode(SCOUTS, 'Scout Sergeant', 'Power sword') as ItemNode
-    let r = act(build(), { t: 'fighter/add', typeId: sergeant.id })
-    r = act(r, { t: 'gear/set', uid: r.fighters[0].uid, nodeId: sword.id, qty: 1 })
-    r = act(r, { t: 'fighter/duplicate', uid: r.fighters[0].uid })
-    expect(r.fighters).toHaveLength(2)
-    expect(r.fighters[1].gear).toEqual(r.fighters[0].gear)
-    expect(r.fighters[1].uid).not.toBe(r.fighters[0].uid)
-  })
-
-  it('does not mutate the roster it is given', () => {
-    const scout = typeByName(SCOUTS, 'Scout')
-    const before = build()
-    const snapshot = structuredClone(before)
-    applyAction(pack, before, { t: 'fighter/add', typeId: scout.id })
-    expect(before).toEqual(snapshot)
-  })
-
-  it('leaves an unknown fighter type alone', () => {
-    const r = build()
-    expect(applyAction(pack, r, { t: 'fighter/add', typeId: 'nope' })).toBe(r)
-  })
-})
-
-describe('every fighter type in every faction', () => {
-  it('can be added, fully kitted and costed without throwing', () => {
-    for (const fac of pack.factions) {
-      for (const type of fac.fighters) {
-        let r = act(build(fac.id), { t: 'band/setBudget', value: 99_999 }, { t: 'fighter/add', typeId: type.id })
-        const uid = r.fighters[0].uid
-        const idx = fighterIndex(fighterType(pack, fac.id, type.id)!)
-        for (const [id, node] of idx.byId) {
-          if (node.k !== 'i') continue
-          r = act(r, { t: 'gear/set', uid, nodeId: id, qty: 1 })
-        }
-        const costs = computeCosts(pack, r)
-        expect(Number.isFinite(costs.total), `${fac.name}/${type.name}`).toBe(true)
-        expect(costs.total, `${fac.name}/${type.name}`).toBeGreaterThanOrEqual(type.cost)
-        expect(() => validate(pack, r, costs)).not.toThrow()
-        expect(() => gearLines(pack, r, r.fighters[0])).not.toThrow()
+describe('every root of every faction', () => {
+  it.each([
+    ['swa', swa],
+    ['hh3', hh3],
+  ])('%s: resolves, costs and validates without throwing', (_id, pack) => {
+    let checked = 0
+    for (const f of pack.factions) {
+      const base = newRoster(pack, f.id)
+      const ctx = new Ctx(pack, base)
+      const tree = ctx.treeFor(f.id)
+      for (const child of f.roots) {
+        const node = tree.root(child)
+        expect(node, `${f.name} root resolves`).toBeTruthy()
+        const r = applyAction(pack, base, {
+          t: 'unit/add',
+          forceUid: base.forces[0].uid,
+          factionId: f.id,
+          rootId: childId(child),
+        })
+        if (r === base) continue
+        const unitCtx = new Ctx(pack, r)
+        const costs = computeCosts(unitCtx)
+        expect(Number.isFinite(costs.total), `${f.name}/${node!.name} cost`).toBe(true)
+        expect(() => validate(unitCtx, costs)).not.toThrow()
+        checked++
       }
     }
+    expect(checked).toBeGreaterThan(100)
   })
 })
