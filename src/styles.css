@@ -613,3 +613,44 @@ table.prof th {
 .tiny {
   font-size: 11px;
 }
+
+/* ---------------------------------------------------------------------------- forces */
+
+.force {
+  border-left: 2px solid var(--line);
+  padding-left: 8px;
+}
+
+.force > .force-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.force > .force-head input {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 12px;
+  background: transparent;
+  border-color: transparent;
+  padding: 2px 4px;
+}
+
+.force > .force-head input:hover,
+.force > .force-head input:focus {
+  border-color: var(--line);
+  background: #0f1114;
+}
+
+.issues {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.paper table.grid tr.force-row td {
+  background: #eee;
+  border-top: 1pt solid #111;
+}

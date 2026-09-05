@@ -1,10 +1,13 @@
 # BandBuilder
 
-Builder drużyn do **Shadow War: Armageddon**. Działa offline, bez konta i bez serwera.
+Builder list do gier bitewnych. Działa offline, bez konta i bez serwera.
 
-Dodawanie i usuwanie wojowników · zliczanie punktów · ekwipunek z zagnieżdżonymi opcjami · walidacja legalności drużyny · tryb kampanii (XP, awanse, kontuzje, promethium caches) · wydruk do PDF.
+Dodawanie i usuwanie pozycji · zliczanie punktów · ekwipunek z zagnieżdżonymi opcjami · walidacja legalności listy · wydruk do PDF.
 
-**15 frakcji, 123 typy wojowników** z profilami broni, zasadami specjalnymi i drzewami umiejętności.
+| System | Zawartość |
+|---|---|
+| **Shadow War: Armageddon** | 15 frakcji, 123 typy wojowników, tryb kampanii (XP, awanse, kontuzje, promethium caches) |
+| **Horus Heresy 3rd Edition** | 32 frakcje, ~5900 pozycji, organizacja sił z detachmentami, oddziały o zmiennej liczebności |
 
 ---
 
@@ -22,7 +25,7 @@ Wersja z instalatorem i skrótem na pulpicie: `npm run exe:setup` → `release\B
 
 `start.cmd` (dwuklik) buduje przy pierwszym razie i podaje aplikację na `http://localhost:8787`. Wymaga [Node.js](https://nodejs.org).
 
-Można też otworzyć `dist\index.html` wprost z dysku — to jeden samowystarczalny plik HTML. Uwaga: część przeglądarek nie zapisuje danych dla adresów `file://`, więc drużyny mogą nie przetrwać zamknięcia karty. Aplikacja to wykrywa i ostrzega na górnym pasku.
+Można też otworzyć `dist\index.html` wprost z dysku — to jeden samowystarczalny plik HTML. Uwaga: część przeglądarek nie zapisuje danych dla adresów `file://`, więc listy mogą nie przetrwać zamknięcia karty. Aplikacja to wykrywa i ostrzega na górnym pasku.
 
 ### Komendy
 
@@ -37,41 +40,47 @@ npm test            # testy silnika
 
 ## Jak to działa
 
-- **Drużyny zapisują się automatycznie** po każdej zmianie. `Ctrl+Z` / `Ctrl+Y` cofa i ponawia.
-- **Eksport JSON** to kopia zapasowa i sposób przenoszenia drużyny na inny komputer. `Import` wczytuje taki plik.
+- **Listy zapisują się automatycznie** po każdej zmianie. `Ctrl+Z` / `Ctrl+Y` cofa i ponawia.
+- **Eksport JSON** to kopia zapasowa i sposób przenoszenia listy na inny komputer. `Import` wczytuje taki plik.
 - **Wydruk PDF** pokazuje dokument dokładnie tak, jak zostanie wydrukowany. W wersji desktopowej *Zapisz PDF* zapisuje plik bezpośrednio (`Ctrl+P` otwiera widok wydruku); w przeglądarce *Drukuj / Zapisz jako PDF* otwiera okno druku, gdzie trzeba wybrać „Zapisz jako PDF" jako drukarkę. Trzy części do włączania osobno:
-  - **Karta drużyny** — jedna strona: statystyki i ekwipunek wszystkich modeli, suma punktów, status legalności,
-  - **Karty wojowników** — po jednej na model, z ujednoliconą tabelą broni i kratkami na rany, amunicję (jedna na strzał plus po jednej za każdy wykupiony reload), XP i kontuzje,
-  - **Ściąga broni** — unikalne profile broni użytych w drużynie, opcjonalnie z treścią zasad specjalnych.
+  - **Lista** — jedna strona: detachmenty, pozycje z ekwipunkiem, suma punktów, status legalności,
+  - **Karty** — po jednej na pozycję: statystyki, tabele profili broni i wyposażenia, zasady. W Shadow War dochodzą kratki na rany, amunicję (jedna na strzał plus po jednej za każdy wykupiony reload), XP i kontuzje,
+  - **Ściąga** — wszystkie profile użyte na liście, pogrupowane po typie, opcjonalnie z treścią zasad specjalnych.
 - **Nic nie jest blokowane.** Można przekroczyć budżet albo limit modeli — aplikacja pokaże to jako błąd, ale nie zabroni. Przy budowaniu listy notorycznie przechodzi się przez stany nielegalne.
+- **Limity liczone są na żywo.** W Horus Heresy „1–5 modeli może wymienić broń" to limit rosnący z liczebnością oddziału; nagłówek grupy pokazuje aktualną wartość, a nie tę z książki.
 - **Niedostępne opcje są wyszarzone z powodem**, nie ukryte („grupa pełna (1/1)", „wymaga wcześniejszego wyboru").
 
 ## Dane
 
-Dane systemu pochodzą ze społecznościowego repozytorium [BSData/wh40k-shadow-war-armageddon](https://github.com/BSData/wh40k-shadow-war-armageddon) (BattleScribe), przetworzonego na własny format:
+Dane obu systemów pochodzą ze społecznościowych repozytoriów BattleScribe — [wh40k-shadow-war-armageddon](https://github.com/BSData/wh40k-shadow-war-armageddon) (XML) i [horus-heresy-3rd-edition](https://github.com/BSData/horus-heresy-3rd-edition) (JSON) — przetworzonych na wspólny format:
 
 ```bash
-npm run fetch-data    # pobiera pliki .gst/.cat do data/bsdata/
-npm run import-data   # buduje src/data/swa.json + data/IMPORT-REPORT.md
+npm run fetch-data          # oba systemy do data/bsdata/<system>/
+npm run fetch-data hh3      # tylko jeden
+npm run import-data         # buduje src/data/<system>.json + raporty importu
 ```
 
-Raport importu wypisuje wszystko, czego nie udało się zmapować, oraz konflikty w danych źródłowych — patrz [data/IMPORT-REPORT.md](data/IMPORT-REPORT.md). Surowe pliki BattleScribe nie są trzymane w repozytorium.
+Raporty importu wypisują wszystko, czego nie udało się zmapować, oraz konflikty w danych źródłowych — [swa](data/IMPORT-REPORT-swa.md), [hh3](data/IMPORT-REPORT-hh3.md). Surowe pliki BattleScribe nie są trzymane w repozytorium.
+
+### Dodanie kolejnego systemu
+
+Dopisz wpis do [tools/systems.mjs](tools/systems.mjs) (repozytorium BSData, format `xml` albo `json`, słownictwo, domyślny budżet), dodaj go do listy w [src/systems.ts](src/systems.ts), potem `npm run fetch-data <id> && npm run import-data <id>`. Silnik jest agnostyczny wobec systemu — nie ma w nim niczego specyficznego dla żadnej gry.
 
 Warhammer 40,000 i Shadow War: Armageddon są własnością Games Workshop. Dane są utrzymywane przez społeczność i nie są w żaden sposób autoryzowane przez GW; sama aplikacja jest generyczna i bez wczytanego data packa nie zawiera treści żadnej gry.
 
 ## Struktura
 
 ```
-src/core/      model danych, koszty, walidacja, akcje — czysty TypeScript, bez UI
+src/core/      model danych, drzewo, ewaluator modyfikatorów, koszty, walidacja, akcje
 src/ui/        panele React + widok do druku
-src/data/      wygenerowany data pack (swa.json)
-src/store/     zapis w przeglądarce, eksport/import JSON
+src/data/      wygenerowane data packi (swa.json, hh3.json)
+src/store/     zapis w przeglądarce, eksport/import JSON, migracja starych list
 electron/      powłoka desktopowa (okno, menu, zapis PDF)
 tools/         pobieranie i import danych BSData, serwer statyczny, generator ikony
 docs/          research i dokument projektowy
 ```
 
-Testy silnika (`npm test`) pokrywają koszty, walidację reguł drużyny wraz z odstępstwami frakcyjnymi, kampanię i przejście po wszystkich 123 typach wojowników z pełnym ekwipunkiem.
+Testy silnika (`npm test`) działają na obu prawdziwych data packach: koszty, walidacja, kampania, limity skalujące się z liczebnością oddziału oraz przejście po każdej pozycji każdej frakcji w obu systemach.
 
 ## Gdy build .exe się wywala
 

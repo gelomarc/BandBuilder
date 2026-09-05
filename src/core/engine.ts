@@ -205,28 +205,45 @@ function validateForce(ctx: Ctx, force: Force, issues: Issue[]): void {
 
   const template = findTemplate(ctx.pack, force.templateId)
   for (const c of template?.cons ?? []) {
+    // A force constraint counts detachments of this same template, not children of this one:
+    // "exactly one Crusade Primary Detachment in the roster" is min 1 / max 1 at roster scope.
     if (c.field !== 'forces') continue
-    const actual = force.forces.length
+    const pool = c.scope === 'roster' ? allForces(ctx.roster) : (parentOf(ctx.roster, force)?.forces ?? [force])
+    const actual = pool.filter((f) => f.templateId === force.templateId).length
+    const label = plural(c.value, 'detachment', 'detachmenty', 'detachmentów')
     if (c.type === 'max' && actual > c.value)
       issues.push({
-        ruleId: `force-count-max:${force.uid}:${c.id}`,
+        ruleId: `force-count-max:${force.templateId}:${c.id}`,
         severity: 'error',
         scope: 'force',
         targetUid: force.uid,
-        message: `${force.name}: najwyżej ${c.value} pododdziałów, jest ${actual}`,
+        message: `${force.name}: najwyżej ${c.value} ${label} tego typu, jest ${actual}`,
       })
     if (c.type === 'min' && actual < c.value)
       issues.push({
-        ruleId: `force-count-min:${force.uid}:${c.id}`,
+        ruleId: `force-count-min:${force.templateId}:${c.id}`,
         severity: 'error',
         scope: 'force',
         targetUid: force.uid,
-        message: `${force.name}: wymagane co najmniej ${c.value} pododdziałów, jest ${actual}`,
+        message: `${force.name}: wymagane co najmniej ${c.value} ${label} tego typu, jest ${actual}`,
       })
   }
 
   for (const child of force.forces) validateForce(ctx, child, issues)
 }
+
+export function allForces(roster: Roster): Force[] {
+  const out: Force[] = []
+  const walk = (f: Force) => {
+    out.push(f)
+    f.forces.forEach(walk)
+  }
+  roster.forces.forEach(walk)
+  return out
+}
+
+const parentOf = (roster: Roster, force: Force): Force | null =>
+  allForces(roster).find((f) => f.forces.includes(force)) ?? null
 
 export function findTemplate(pack: Pack, id: Id) {
   const search = (list: Pack['forceTemplates']): Pack['forceTemplates'][number] | null => {
@@ -311,12 +328,3 @@ export function statlineOf(pack: Pack, profileIds: Id[]): { columns: string[]; v
   return { columns, values: columns.map((c) => profile.chars[c] ?? '—') }
 }
 
-export function allUnits(roster: Roster): { unit: Roster['forces'][number]['units'][number]; force: Force }[] {
-  const out: { unit: Roster['forces'][number]['units'][number]; force: Force }[] = []
-  const walk = (f: Force) => {
-    for (const u of f.units) out.push({ unit: u, force: f })
-    f.forces.forEach(walk)
-  }
-  roster.forces.forEach(walk)
-  return out
-}

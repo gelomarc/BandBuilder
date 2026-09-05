@@ -74,6 +74,21 @@ describe('packs load', () => {
     expect(pack.primaryCost).toBeTruthy()
   })
 
+  it('reads characteristic values out of both serialisations', () => {
+    // XML puts the value in an attribute and JSON in element text; missing the JSON form left every
+    // Horus Heresy statline blank while every test still passed.
+    for (const [id, pack] of [
+      ['swa', swa],
+      ['hh3', hh3],
+    ] as const) {
+      const profiles = Object.values(pack.profiles)
+      const filled = profiles.filter((p) => Object.keys(p.chars ?? {}).length)
+      expect(filled.length / profiles.length, `${id} profiles with values`).toBeGreaterThan(0.9)
+    }
+    const legionary = Object.values(hh3.profiles).find((p) => p.name === 'Assault Legionary')
+    expect(legionary?.chars.WS).toBeTruthy()
+  })
+
   it('marks a statline type only where the system has one universal model line', () => {
     expect(swa.statlineType).toBeTruthy()
     expect(hh3.statlineType).toBeUndefined()
@@ -243,7 +258,6 @@ describe('Horus Heresy: limits that scale with unit size', () => {
     let r = act(hh3, newRoster(hh3, f.id), { t: 'band/setBudget', value: 3000 })
     r = addUnit(hh3, r, LEGION, 'Assault Squad')
     const uid = lastUnit(r).uid
-    const legionary = nodeByName(hh3, r, uid, 'Legionary')
     const group = nodeByName(hh3, r, uid, /^1-5 may exchange Chainsword/)
     const ctx = ctxOf(hh3, r)
     const view = ctx.unitOf(uid)!

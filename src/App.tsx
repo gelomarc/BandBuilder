@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import packData from './data/swa.json'
-import { computeCosts, validate } from './core/engine'
-import { faction } from './core/pack'
-import { applyAction, newRoster, type Action } from './core/roster'
-import type { CategoryId, Pack, Roster } from './core/types'
+import { Ctx, computeCosts, validate } from './core/engine'
+import { applyAction, findUnit, newRoster, type Action } from './core/roster'
+import type { Id, Pack, Roster } from './core/types'
 import { desktop } from './desktop'
 import {
   downloadJson,
@@ -14,22 +12,27 @@ import {
   saveRosters,
   storageAvailable,
 } from './store/persist'
-import { AddFighterDialog } from './ui/AddFighterDialog'
-import { BandPanel } from './ui/BandPanel'
-import { FighterPanel } from './ui/FighterPanel'
+import { loadPack, SYSTEMS } from './systems'
+import { AddUnitDialog } from './ui/AddUnitDialog'
+import { ForcePanel } from './ui/ForcePanel'
 import { PrintView } from './ui/PrintView'
 import { StatusPanel } from './ui/StatusPanel'
+import { UnitPanel } from './ui/UnitPanel'
 
-const pack = packData as unknown as Pack
 const HISTORY = 60
 
 export function App() {
-  const [rosters, setRosters] = useState<Roster[]>(() => loadRosters())
+  const initial = useRef(loadRosters())
+  const [rosters, setRosters] = useState<Roster[]>(initial.current.rosters)
   const [activeId, setActiveId] = useState<string | null>(() => loadActiveId())
-  const [activeUid, setActiveUid] = useState<string | null>(null)
-  const [adding, setAdding] = useState(false)
+  const [activeUid, setActiveUid] = useState<Id | null>(null)
+  const [addingTo, setAddingTo] = useState<Id | null>(null)
   const [printing, setPrinting] = useState(false)
-  const [toast, setToast] = useState<{ text: string; undo?: () => void } | null>(null)
+  const [toast, setToast] = useState<{ text: string; undo?: () => void } | null>(
+    initial.current.migrated
+      ? { text: `Zaktualizowano ${initial.current.migrated} listę do nowego silnika — ekwipunek trzeba wybrać ponownie` }
+      : null,
+  )
   const [noStorage] = useState(() => !storageAvailable())
   const fileInput = useRef<HTMLInputElement>(null)
 
@@ -38,16 +41,13 @@ export function App() {
   const future = useRef<Roster[]>([])
 
   const roster = rosters.find((r) => r.id === activeId) ?? null
+  const pack: Pack | null = useMemo(() => (roster ? loadPack(roster.pack.id) : null), [roster])
 
-  useEffect(() => {
-    saveRosters(rosters)
-  }, [rosters])
-  useEffect(() => {
-    saveActiveId(activeId)
-  }, [activeId])
+  useEffect(() => void saveRosters(rosters), [rosters])
+  useEffect(() => saveActiveId(activeId), [activeId])
   useEffect(() => {
     if (!toast) return
-    const t = setTimeout(() => setToast(null), 6000)
+    const t = setTimeout(() => setToast(null), 8000)
     return () => clearTimeout(t)
   }, [toast])
 
@@ -57,24 +57,26 @@ export function App() {
 
   const dispatch = useCallback(
     (action: Action) => {
-      if (!roster) return
+      if (!roster || !pack) return
       const next = applyAction(pack, roster, action)
       if (next === roster) return
       past.current = [...past.current.slice(-HISTORY), roster]
       future.current = []
       replace(next)
-      if (action.t === 'fighter/remove') {
-        const gone = roster.fighters.find((f) => f.uid === action.uid)
+
+      if (action.t === 'unit/remove') {
+        const gone = findUnit(roster, action.uid)
         const snapshot = roster
-        setToast({ text: `Usunięto ${gone?.name ?? 'wojownika'}`, undo: () => replace(snapshot) })
+        setToast({ text: `Usunięto ${gone?.name ?? 'pozycję'}`, undo: () => replace(snapshot) })
         if (activeUid === action.uid) setActiveUid(null)
       }
-      if (action.t === 'fighter/add' || action.t === 'fighter/duplicate') {
-        const added = next.fighters.find((f) => !roster.fighters.some((o) => o.uid === f.uid))
-        if (added) setActiveUid(added.uid)
+      if (action.t === 'unit/add' || action.t === 'unit/duplicate') {
+        const before = new Set(allUids(roster))
+        const added = allUids(next).find((u) => !before.has(u))
+        if (added) setActiveUid(added)
       }
     },
-    [roster, replace, activeUid],
+    [roster, pack, replace, activeUid],
   )
 
   const undo = useCallback(() => {
@@ -109,37 +111,12 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [undo, redo])
 
-  const costs = useMemo(() => (roster ? computeCosts(pack, roster) : null), [roster])
-  const issues = useMemo(() => (roster && costs ? validate(pack, roster, costs) : []), [roster, costs])
+  const ctx = useMemo(() => (roster && pack ? new Ctx(pack, roster) : null), [roster, pack])
+  const costs = useMemo(() => (ctx ? computeCosts(ctx) : null), [ctx])
+  const issues = useMemo(() => (ctx && costs ? validate(ctx, costs) : []), [ctx, costs])
 
-  // The band panel and the add dialog both want "used / allowed" per category, which is exactly
-  // the band rules evaluated without the message text.
-  const limits = useMemo(() => {
-    const out: Record<string, { limit: number; actual: number }> = {}
-    if (!roster) return out
-    const fac = faction(pack, roster.factionId)
-    for (const rule of fac?.bandRules ?? []) {
-      if (rule.type !== 'max' || rule.count !== 'fighters') continue
-      let limit = rule.value
-      if (rule.unit === 'percentOfCount') limit = Math.floor((rule.value / 100) * roster.fighters.length)
-      for (const adj of rule.adjust ?? []) {
-        const n = roster.fighters.filter(
-          (f) => faction(pack, roster.factionId)?.fighters.find((t) => t.id === f.typeId)?.categoryId === adj.perFighterWhere.category,
-        ).length
-        limit += adj.delta * n
-      }
-      const actual = rule.where
-        ? roster.fighters.filter(
-            (f) => fac?.fighters.find((t) => t.id === f.typeId)?.categoryId === (rule.where!.category as CategoryId),
-          ).length
-        : roster.fighters.length
-      out[rule.id] = { limit, actual }
-    }
-    return out
-  }, [roster])
-
-  const createRoster = (factionId: string) => {
-    const r = newRoster(pack, factionId)
+  const createRoster = (systemId: string, factionId: Id) => {
+    const r = newRoster(loadPack(systemId), factionId)
     setRosters((list) => [...list, r])
     setActiveId(r.id)
     setActiveUid(null)
@@ -158,12 +135,12 @@ export function App() {
     }
   }
 
-  const fighter = roster?.fighters.find((f) => f.uid === activeUid) ?? null
+  const unit = roster && activeUid ? findUnit(roster, activeUid) : null
 
-  if (printing && roster && costs)
+  if (printing && roster && ctx && costs)
     return (
       <PrintView
-        pack={pack}
+        ctx={ctx}
         roster={roster}
         costs={costs}
         legal={issues.every((i) => i.severity !== 'error')}
@@ -183,9 +160,9 @@ export function App() {
             past.current = []
             future.current = []
           }}
-          aria-label="Drużyna"
+          aria-label="Lista"
         >
-          <option value="">— wybierz drużynę —</option>
+          <option value="">— wybierz listę —</option>
           {rosters.map((r) => (
             <option key={r.id} value={r.id}>
               {r.name}
@@ -219,10 +196,10 @@ export function App() {
                 const snapshot = rosters
                 setRosters((list) => list.filter((r) => r.id !== roster.id))
                 setActiveId(null)
-                setToast({ text: `Usunięto drużynę „${roster.name}"`, undo: () => setRosters(snapshot) })
+                setToast({ text: `Usunięto listę „${roster.name}"`, undo: () => setRosters(snapshot) })
               }}
             >
-              Usuń drużynę
+              Usuń listę
             </button>
           </>
         )}
@@ -230,42 +207,29 @@ export function App() {
         {noStorage && <span className="tiny" style={{ color: 'var(--warn)' }}>Brak pamięci przeglądarki — eksportuj JSON</span>}
       </div>
 
-      {!roster || !costs ? (
+      {!roster || !ctx || !costs ? (
         <Welcome onCreate={createRoster} count={rosters.length} />
       ) : (
         <div className="columns">
-          <BandPanel
-            pack={pack}
+          <ForcePanel
+            ctx={ctx}
             roster={roster}
             costs={costs}
-            limits={limits}
             activeUid={activeUid}
             onSelect={setActiveUid}
+            onAddUnit={setAddingTo}
             dispatch={dispatch}
-            onAdd={() => setAdding(true)}
           />
-          {fighter ? (
-            <FighterPanel
-              pack={pack}
-              roster={roster}
-              fighter={fighter}
-              costs={costs}
-              issues={issues}
-              dispatch={dispatch}
-            />
+          {unit ? (
+            <UnitPanel ctx={ctx} unit={unit} costs={costs} issues={issues} dispatch={dispatch} />
           ) : (
             <div className="col">
-              <h1>{pack.vocabulary.fighter}</h1>
-              <p className="muted">
-                Wybierz {pack.vocabulary.fighterAcc} z listy po lewej albo dodaj nowego.
-              </p>
-              <button className="primary" onClick={() => setAdding(true)}>
-                + Dodaj {pack.vocabulary.fighterAcc}
-              </button>
+              <h1>{ctx.pack.vocabulary.fighter}</h1>
+              <p className="muted">Wybierz pozycję z listy po lewej albo dodaj nową.</p>
             </div>
           )}
           <StatusPanel
-            pack={pack}
+            ctx={ctx}
             roster={roster}
             costs={costs}
             issues={issues}
@@ -277,14 +241,13 @@ export function App() {
         </div>
       )}
 
-      {adding && roster && costs && (
-        <AddFighterDialog
-          pack={pack}
-          roster={roster}
+      {addingTo && ctx && costs && roster && (
+        <AddUnitDialog
+          ctx={ctx}
+          factionId={roster.factionId}
           costs={costs}
-          limits={limits}
-          onAdd={(typeId) => dispatch({ t: 'fighter/add', typeId })}
-          onClose={() => setAdding(false)}
+          onAdd={(factionId, rootId) => dispatch({ t: 'unit/add', forceUid: addingTo, factionId, rootId })}
+          onClose={() => setAddingTo(null)}
         />
       )}
 
@@ -307,36 +270,104 @@ export function App() {
   )
 }
 
-function NewRosterButton({ onCreate }: { onCreate: (factionId: string) => void }) {
+function allUids(roster: Roster): Id[] {
+  const out: Id[] = []
+  const walk = (f: Roster['forces'][number]) => {
+    for (const u of f.units) out.push(u.uid)
+    f.forces.forEach(walk)
+  }
+  roster.forces.forEach(walk)
+  return out
+}
+
+function FactionPicker({ systemId, onPick }: { systemId: string; onPick: (factionId: Id) => void }) {
+  const pack = loadPack(systemId)
+  const [q, setQ] = useState('')
+  const factions = pack.factions.filter((f) => !f.library && f.name.toLowerCase().includes(q.toLowerCase()))
+  return (
+    <>
+      <div className="row" style={{ marginBottom: 8 }}>
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Szukaj frakcji…" style={{ flex: 1 }} autoFocus />
+      </div>
+      {factions.map((f) => (
+        <button key={f.id} className="pick" onClick={() => onPick(f.id)}>
+          <span className="nm">{f.name}</span>
+          <span className="muted tiny">{f.roots.length} pozycji</span>
+        </button>
+      ))}
+      {!factions.length && <p className="muted">Brak wyników.</p>}
+    </>
+  )
+}
+
+/**
+ * Choosing a system parses its pack, which for Horus Heresy is ten megabytes and blocks for about
+ * half a second. Yielding a frame first means the click is acknowledged instead of appearing stuck.
+ */
+function useSystemChoice() {
+  const [system, setSystem] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+  const choose = (id: string | null) => {
+    if (!id) {
+      setSystem(null)
+      return
+    }
+    setLoading(true)
+    setTimeout(() => {
+      loadPack(id)
+      setSystem(id)
+      setLoading(false)
+    }, 16)
+  }
+  return { system, loading, choose }
+}
+
+function NewRosterButton({ onCreate }: { onCreate: (systemId: string, factionId: Id) => void }) {
+  const { system, loading, choose } = useSystemChoice()
   const [open, setOpen] = useState(false)
+  const close = () => {
+    setOpen(false)
+    choose(null)
+  }
   return (
     <>
       <button className="primary" onClick={() => setOpen(true)}>
-        Nowa drużyna
+        Nowa lista
       </button>
       {open && (
-        <div className="backdrop" onClick={() => setOpen(false)}>
+        <div className="backdrop" onClick={close}>
           <div className="dialog" onClick={(e) => e.stopPropagation()}>
             <header>
-              <strong>Wybierz frakcję</strong>
+              <strong>{system ? 'Wybierz frakcję' : 'Wybierz system'}</strong>
+              {system && (
+                <button className="ghost tiny" onClick={() => choose(null)}>
+                  ← system
+                </button>
+              )}
             </header>
             <div className="body">
-              {pack.factions.map((f) => (
-                <button
-                  key={f.id}
-                  className="pick"
-                  onClick={() => {
-                    onCreate(f.id)
-                    setOpen(false)
-                  }}
-                >
-                  <span className="nm">{f.name}</span>
-                  <span className="muted tiny">{f.fighters.length} typów</span>
-                </button>
-              ))}
+              {loading ? (
+                <p className="muted">Wczytywanie danych…</p>
+              ) : system ? (
+                <FactionPicker systemId={system} onPick={(factionId) => {
+                  onCreate(system, factionId)
+                  close()
+                }} />
+              ) : (
+                SYSTEMS.map((s) => (
+                  <button key={s.id} className="pick" onClick={() => choose(s.id)}>
+                    <span className="nm">
+                      {s.name}
+                      <br />
+                      <span className="faint tiny">{s.hint}</span>
+                    </span>
+                    <span className="muted tiny">{s.short}</span>
+                  </button>
+                ))
+              )}
             </div>
             <footer>
-              <button onClick={() => setOpen(false)}>Anuluj</button>
+              <button onClick={close}>Anuluj</button>
             </footer>
           </div>
         </div>
@@ -345,28 +376,39 @@ function NewRosterButton({ onCreate }: { onCreate: (factionId: string) => void }
   )
 }
 
-function Welcome({ onCreate, count }: { onCreate: (factionId: string) => void; count: number }) {
+function Welcome({ onCreate, count }: { onCreate: (systemId: string, factionId: Id) => void; count: number }) {
+  const { system, loading, choose } = useSystemChoice()
   return (
-    <div className="col" style={{ maxWidth: 620, margin: '0 auto' }}>
-      <h1>{pack.name}</h1>
+    <div className="col" style={{ maxWidth: 640, margin: '0 auto' }}>
+      <h1>BandBuilder</h1>
       <p className="muted">
         {count > 0
-          ? 'Wybierz drużynę na górze albo zacznij nową.'
-          : 'Zacznij od wyboru frakcji. Drużyny zapisują się w tej przeglądarce; plik JSON to kopia zapasowa.'}
+          ? 'Wybierz listę na górze albo zacznij nową.'
+          : 'Zacznij od wyboru systemu. Listy zapisują się lokalnie; plik JSON to kopia zapasowa.'}
       </p>
       <div className="stack" style={{ marginTop: 12 }}>
-        {pack.factions.map((f) => (
-          <button key={f.id} className="pick" onClick={() => onCreate(f.id)}>
-            <span className="nm">{f.name}</span>
-            <span className="muted tiny">
-              {f.fighters.length} typów · {f.bandRules.find((r) => r.id === 'max-fighters')?.value ?? '?'} modeli maks.
-            </span>
-          </button>
-        ))}
+        {loading ? (
+          <p className="muted">Wczytywanie danych…</p>
+        ) : system ? (
+          <>
+            <button className="ghost" style={{ alignSelf: 'flex-start' }} onClick={() => choose(null)}>
+              ← inny system
+            </button>
+            <FactionPicker systemId={system} onPick={(factionId) => onCreate(system, factionId)} />
+          </>
+        ) : (
+          SYSTEMS.map((s) => (
+            <button key={s.id} className="pick" onClick={() => choose(s.id)}>
+              <span className="nm">
+                {s.name}
+                <br />
+                <span className="faint tiny">{s.hint}</span>
+              </span>
+              <span className="muted tiny">{s.short}</span>
+            </button>
+          ))
+        )}
       </div>
-      <p className="tiny faint" style={{ marginTop: 16 }}>
-        Dane: {pack.source.note}
-      </p>
     </div>
   )
 }

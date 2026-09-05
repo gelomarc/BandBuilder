@@ -166,14 +166,17 @@ function collectInfo(node, pack, idx) {
   const addProfile = (p) => {
     const chars = {}
     for (const c of list(p.characteristics)) {
-      const value = String(c.value ?? '').trim()
+      // XML carries the value in an attribute, JSON as element text; the two serialisations of the
+      // same model disagree here and only here.
+      const value = String(c.$text ?? c.value ?? '').trim()
       if (value) chars[c.name] = value
     }
+    if (!Object.keys(chars).length) warn(`profil bez żadnej wartości: "${p.name}"`)
     pack.profiles[p.id] = clean({ id: p.id, name: p.name, typeId: p.typeId ?? p.profileTypeId, chars })
     profs.push(p.id)
   }
   const addRule = (r) => {
-    pack.rules[r.id] = clean({ id: r.id, name: r.name, text: String(r.description ?? '').trim() })
+    pack.rules[r.id] = clean({ id: r.id, name: r.name, text: String(r.description ?? r.$text ?? '').trim() })
     rules.push(r.id)
   }
 
@@ -389,23 +392,60 @@ function importSystem(systemId) {
   for (const [id, src] of idx.entries) pack.nodes[id] = nodeOf(src, false, pack, idx)
   for (const [id, src] of idx.groups) pack.nodes[id] = nodeOf(src, true, pack, idx)
 
-  // Each catalogue contributes the roots a player can actually pick.
+  // Each catalogue contributes the roots a player can pick, plus everything it imports. A Legion
+  // catalogue holds about a dozen of its own entries and pulls the ~170 common Legiones Astartes
+  // units in through a catalogue link, so ignoring those links leaves every Legion nearly empty.
+  const byCatalogueId = new Map(docs.map((d) => [d.doc.id, d]))
+  const ownRoots = new Map()
+  for (const { doc } of docs)
+    ownRoots.set(
+      doc.id,
+      [
+        ...list(doc.entryLinks).map((l) => linkOf(l, pack, idx)),
+        ...list(doc.selectionEntries).map((e) => nodeOf(e, false, pack, idx)),
+      ].filter((r) => !r.hidden),
+    )
+
+  const importedRoots = (docId, seen = new Set()) => {
+    if (seen.has(docId)) return []
+    seen.add(docId)
+    const entry = byCatalogueId.get(docId)
+    if (!entry) return []
+    const out = [...(ownRoots.get(docId) ?? [])]
+    for (const link of list(entry.doc.catalogueLinks)) {
+      if (link.importRootEntries === false) continue
+      if (!byCatalogueId.has(link.targetId)) {
+        unmapped(`unresolved catalogue link "${link.name}"`)
+        continue
+      }
+      out.push(...importedRoots(link.targetId, seen))
+    }
+    return out
+  }
+
   for (const { doc, isGameSystem } of docs) {
-    const roots = [
-      ...list(doc.entryLinks).map((l) => linkOf(l, pack, idx)),
-      ...list(doc.selectionEntries).map((e) => nodeOf(e, false, pack, idx)),
-    ].filter((r) => !r.hidden)
+    const seenRoot = new Set()
+    const roots = importedRoots(doc.id).filter((r) => {
+      const key = r.link ?? r.id
+      if (seenRoot.has(key)) return false
+      seenRoot.add(key)
+      return true
+    })
     if (!roots.length) continue
-    if (isGameSystem && roots.length < 3) {
-      report.notes.push(`${doc.name}: ${roots.length} korzeni w pliku systemu, pominięte jako frakcja`)
+    const name = String(doc.name).trim()
+    // The game system file carries a few loose entries for the editor's benefit, not a playable
+    // force; catalogues are what a player picks.
+    if (isGameSystem) {
+      report.notes.push(`${name}: ${roots.length} korzeni w pliku systemu, nie jest frakcją`)
       continue
     }
     pack.factions.push({
-      id: String(doc.name)
+      id: name
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-|-$/g, ''),
-      name: String(doc.name).replace(/^[IVXLC]+\s*-\s*/, '').trim(),
+      // Catalogue names carry their Legion numeral, which is decoration in a picker.
+      name: name.replace(/^[IVXLC]+\s*-\s*/, '').trim(),
       library: doc.library === true,
       roots,
     })

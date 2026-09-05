@@ -1,8 +1,8 @@
 # BandBuilder — dokument projektowy
 
-Wersja: 0.3 · Data: 2026-09-04 · Podstawa: [RESEARCH.md](RESEARCH.md)
+Wersja: 0.4 · Data: 2026-09-05 · Podstawa: [RESEARCH.md](RESEARCH.md)
 
-> Sekcje §1–§12 to projekt sprzed implementacji. **§13 opisuje to, co faktycznie zbudowano**, wraz z miejscami, w których realne dane BSData wymusiły zmianę modelu; **§14 dokłada powłokę desktopową**. Gdzie §13–§14 mówią coś innego niż §1–§12, prawdą jest §13–§14.
+> Sekcje §1–§12 to projekt sprzed implementacji. **§13 opisuje pierwszą wersję**, §14 powłokę desktopową, a **§15 przebudowę rdzenia pod Horus Heresy 3rd Edition**, która zastąpiła sporą część §13. Gdzie sekcje się nie zgadzają, prawdą jest najpóźniejsza.
 
 ---
 
@@ -648,9 +648,10 @@ Uwaga prawna: dane SWA to własność Games Workshop. Data packi trzymamy **osob
 | **M3** ✅ | Trzy szablony wydruku: karta drużyny, karty wojowników, ściąga broni | Wydruk używalny przy stole |
 | **M4** ✅ | Tryb kampanii: XP, drzewa umiejętności, awanse atrybutów, kontuzje, status, promethium caches, log gier | Wyróżnik wobec New Recruit dla SWA |
 | **M5** ✅ | Wersja desktopowa: portable `.exe` z natywnym zapisem PDF (§14) | Produkt bez zależności od Node.js |
-| **M6** ⬜ | Share linki, PWA, wczytywanie własnych data packów, drugi system gry (Necromunda '95 / Mordheim) jako test generyczności modelu | Skalowanie |
+| **M6** ✅ | Drugi system: Horus Heresy 3rd Edition — ewaluator modyfikatorów, organizacja sił, oddziały wielomodelowe (§15) | Silnik przestał być pisany pod jedną grę |
+| **M7** ⬜ | Share linki, PWA, wczytywanie własnych data packów z pliku | Skalowanie |
 
-M0–M5 są zbudowane. Szczegóły i odstępstwa od projektu: §13 i §14.
+M0–M6 są zbudowane. Szczegóły i odstępstwa od projektu: §13, §14 i §15.
 
 ---
 
@@ -777,3 +778,57 @@ Menu celowo nie ma sekcji „Edycja": jej natywne role undo/redo przechwyciłyby
 - **Brak podpisu kodu.** Przy pierwszym uruchomieniu Windows pokazuje SmartScreen. Podpisanie wymaga płatnego certyfikatu — nie ma sensu dla narzędzia dla jednej osoby.
 - **Build `.exe` wymaga obejścia** błędu `electron-builder` z symlinkami macOS w paczce `winCodeSign` na Windowsie bez trybu programisty. Procedura jest w README.
 - **Tylko x64 Windows.** Inne cele (`--linux`, `--mac`, arm64) są kwestią jednego przełącznika, ale nie były potrzebne.
+
+---
+
+## 15. Drugi system: Horus Heresy 3rd Edition
+
+Dane dla HH3 istnieją i są w bardzo dobrym stanie — [BSData/horus-heresy-3rd-edition](https://github.com/BSData/horus-heresy-3rd-edition), 43 katalogi, ~19 MB JSON-a, kilkadziesiąt commitów miesięcznie. Problemem nie były dane, tylko to, że silnik z §13 był napisany pod jedną grę.
+
+### 15.1 Czego brakowało
+
+Rozbiór `Assault Squad` z Legiones Astartes pokazał cztery braki naraz:
+
+```
+unit  Assault Squad          32 pts
+  model Legionary            12 pts   min 9, max 19
+    group 2-5 can exchange their Chainsword for:   max:selections=0@unit
+  model Sergeant              0 pts   min 1, max 1
+```
+
+1. **Oddział zawierający N modeli.** W SWA wojownik *był* modelem. Tu jest koszt własny oddziału (32) plus koszt za model (12) i zakres liczebności 9–19.
+2. **Modyfikatory i warunki.** W dwóch plikach z 43 jest **7766 modyfikatorów i 13228 warunków**. To one realizują „2–5 modeli może wymienić…” — limit rośnie z liczebnością. Silnik z §13 nie ewaluował ich w ogóle; wystarczał mu jeden wzorzec.
+3. **Zasięgi constraintów.** `parent`, `unit`, `model`, `force`, `roster`, `ancestor`, `self`, `primary-catalogue`. Wcześniej obsługiwany był wyłącznie `parent`, i to niejawnie.
+4. **Organizacja sił.** 330 kategorii, 8 typów kosztów, szablony detachmentów zagnieżdżone w sobie — 86 rodzajów detachmentu pod jednym Crusade Force Organization Chart.
+
+### 15.2 Pack zachowuje współdzielenie
+
+Pack SWA był spłaszczony: każdy link inline'owany w miejsce użycia. Dla HH3 to nie przechodzi — 18 MB źródeł, które współdzielą agresywnie, spuchłoby o rząd wielkości. Schemat 2 zachowuje więc linki: dziecko węzła to albo węzeł inline, albo `{ link, id, …nadpisania }` wskazujący do wspólnej puli, a silnik rozwiązuje je w trakcie chodzenia po drzewie.
+
+Konsekwencja: identyfikatory węzłów przestały być unikalne, więc **selekcja jest adresowana ścieżką** — `/root/grupa/link/broń`. Ta sama współdzielona broń w dwóch slotach to dwie różne selekcje, a roster nie duplikuje struktury katalogu.
+
+### 15.3 Ewaluator
+
+`src/core/evaluate.ts` buduje kontekst dla jednego stanu rostera i odpowiada na pytania, które zadają warunki i powtórzenia: „ile modeli jest w tym oddziale”, „czy w tej sile jest Praetor”, „ile detachmentów tego typu ma lista”. Na tej podstawie `effective(view, node)` zwraca węzeł po zastosowaniu modyfikatorów — z poprawionymi limitami, kosztem, widocznością, nazwą i kategoriami.
+
+Semantyka `repeat`, odczytana z danych: „na każde `value` trafień w zasięgu zastosuj modyfikator `repeats` razy”. Stąd „1–5 może wymienić” to constraint `max 0` podniesiony o 1 za każde 5 modeli.
+
+### 15.4 Katalogi importują katalogi
+
+Katalog Legionu ma kilkanaście własnych pozycji i wciąga ~170 wspólnych przez `catalogueLinks` z biblioteki Legiones Astartes. Pierwsze podejście ignorowało te linki i dawało Ultramarines 13 pozycji zamiast 212. Importer rozwiązuje je teraz przechodnio; biblioteki są oznaczone i nie pojawiają się jako frakcje.
+
+### 15.5 Dwie serializacje tego samego modelu
+
+SWA jest w XML-u, HH3 w JSON-ie — ten sam model obiektowy, inny zapis. `tools/bs-normalize.mjs` sprowadza XML do kształtu JSON-a i dalej działa jeden importer.
+
+Różnią się dokładnie w jednym miejscu, które kosztowało osobny błąd: wartość charakterystyki to atrybut `value` w XML-u i tekst elementu (`$text`) w JSON-ie. Efektem był komplet statystyk HH3 pustych, przy wszystkich testach na zielono — bo testy sprawdzały koszty i limity, nie profile. Test regresyjny sprawdza teraz, że ponad 90% profili w każdym packu ma wartości.
+
+### 15.6 Czego świadomie nie ma
+
+- **Force-level constraints na typach kosztów.** HH3 limituje detachmenty pomocnicze przez „max 0 Auxiliary Detachment Points”, podnoszone modyfikatorami na szablonie siły. Ewaluator działa w kontekście oddziału, nie siły, więc te constrainty są pomijane. Zgłaszanie ich bez modyfikatorów dawałoby fałszywe błędy przy każdej liście, a fałszywy błąd jest gorszy niż brakująca kontrola.
+- **Ograniczenia frakcyjne pozycji.** Można wstawić oddział z dowolnej frakcji do dowolnej listy (przydatne dla sojuszników, ale nie waliduje ich legalności).
+- **Migracja list z wersji 1** przenosi nazwy, frakcję, budżet i kampanię, ale **nie ekwipunek** — adresowanie zmieniło się z identyfikatorów na ścieżki. Aplikacja mówi o tym wprost przy wczytaniu.
+
+### 15.7 Koszt
+
+Pack HH3 to 11,9 MB, więc jednoplikowy build urósł z 1,1 do 13,5 MB, a `.exe` odpowiednio. Packi są importowane jako tekst i parsowane dopiero przy wyborze systemu (~0,5 s dla HH3), żeby otwarcie kill teamu nie płaciło za dane, których nie użyje.
